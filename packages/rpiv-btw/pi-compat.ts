@@ -1,7 +1,7 @@
 /**
- * Host-version-tolerant loader for pi-ai's `completeSimple`.
+ * Host-version-tolerant loaders for pi-ai's global dispatch helpers.
  *
- * Pi >= 0.80.1 moved the global dispatch API (`completeSimple` et al.) to the
+ * Pi >= 0.80.1 moved the global dispatch API (`streamSimple` et al.) to the
  * "@earendil-works/pi-ai/compat" entrypoint; hosts <= 0.79.x export it from
  * the package root and have no /compat entrypoint at all. pi-ai resolves at
  * runtime against the HOST's copy (peerDependency "*"), so neither path can
@@ -16,7 +16,7 @@
  * migration); when that lands, this module is the single place to migrate.
  */
 
-type CompleteSimpleFn = typeof import("@earendil-works/pi-ai/compat").completeSimple;
+type StreamSimpleFn = typeof import("@earendil-works/pi-ai/compat").streamSimple;
 type IsContextOverflowFn = typeof import("@earendil-works/pi-ai/compat").isContextOverflow;
 
 /**
@@ -47,21 +47,21 @@ function isModuleNotFound(err: unknown): boolean {
 	return false;
 }
 
-export async function loadCompleteSimple(): Promise<CompleteSimpleFn> {
-	let mod: { completeSimple?: CompleteSimpleFn };
+export async function loadStreamSimple(): Promise<StreamSimpleFn> {
+	let mod: { streamSimple?: StreamSimpleFn };
 	try {
-		mod = (await import("@earendil-works/pi-ai/compat")) as { completeSimple?: CompleteSimpleFn };
+		mod = (await import("@earendil-works/pi-ai/compat")) as { streamSimple?: StreamSimpleFn };
 	} catch (err) {
-		if (!isModuleNotFound(err)) throw err; // a real /compat failure must surface, not mask as a fallback
-		mod = (await import("@earendil-works/pi-ai")) as { completeSimple?: CompleteSimpleFn };
+		if (!isModuleNotFound(err)) throw err;
+		mod = (await import("@earendil-works/pi-ai")) as { streamSimple?: StreamSimpleFn };
 	}
-	const completeSimple = mod.completeSimple;
-	if (typeof completeSimple !== "function") {
+	const streamSimple = mod.streamSimple;
+	if (typeof streamSimple !== "function") {
 		throw new Error(
-			"pi-ai does not expose completeSimple on /compat or the package root — unsupported host pi-ai version",
+			"pi-ai does not expose streamSimple on /compat or the package root — unsupported host pi-ai version",
 		);
 	}
-	return completeSimple;
+	return streamSimple;
 }
 
 /**
@@ -70,9 +70,9 @@ export async function loadCompleteSimple(): Promise<CompleteSimpleFn> {
  *
  * `isContextOverflow` is re-exported from BOTH the `/compat` entrypoint and the
  * package root (defined in pi-ai's `utils/overflow`), so the resolution path
- * mirrors `loadCompleteSimple`: try `/compat`, fall back to the root only on a
+ * mirrors `loadStreamSimple`: try `/compat`, fall back to the root only on a
  * module-resolution failure, and rethrow a real `/compat` init failure so it is
- * not masked by the fallback. Unlike `completeSimple`, the export's ABSENCE is
+ * not masked by the fallback. Unlike `streamSimple`, the export's ABSENCE is
  * an expected host state (older pi-ai, or a host that surfaces it from neither
  * entrypoint), not an unsupported-host error: per the Option-3 refinement the
  * missing-export case returns `undefined` so the caller degrades gracefully

@@ -1,35 +1,12 @@
-/**
- * btw-ui — dynamic-height bottom-slot overlay for /btw.
- *
- * Layout (grows with content, bottom-anchored, max = terminal height):
- *   banner (theme.bg stripe, padded to width)        sticky top
- *   blank
- *   history  — "/btw <q>" (accent prefix + muted text), left-padded 2 cols
- *   echo     — "/btw <q>" (accent prefix + muted text), left-padded 2 cols
- *   blank
- *   answer   — body wrapped at width-2, left-padded 2 cols
- *   blank
- *   footer   — key hints (dim)                       sticky bottom
- *
- * Natural height = fixed(5: banner, 3 blanks, footer) + 2 (echo + 1 blank before answer)
- *                  + history.length + answerLines.length.
- * Pi-tui bottom-anchors the overlay so it grows upward with each /btw message.
- * If natural height > terminal rows, we clip from the top (older history scrolls off)
- * and ↑/↓ scroll the clip window.
- *
- * Keys (via matchesKey — handles ANSI + Kitty):
- *   Esc → abort in-flight call + dismiss
- *   ↑/↓ → scroll (when content exceeds terminal)
- *   x   → clear current-session /btw history
- *   (f fork key deferred)
- */
+/** Centered, streaming card and footer wait status for /btw. */
 
-import type { ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
-import type { OverlayOptions } from "@earendil-works/pi-tui";
+import { type ExtensionCommandContext, getMarkdownTheme, type Theme } from "@earendil-works/pi-coding-agent";
 import {
 	type Component,
 	Key,
+	Markdown,
 	matchesKey,
+	type OverlayOptions,
 	type TUI,
 	truncateToWidth,
 	visibleWidth,
@@ -37,30 +14,74 @@ import {
 } from "@earendil-works/pi-tui";
 import { type BtwTurn, userMessageText } from "./btw-messages.js";
 
-const BTW_MAX_HEIGHT_RATIO = 0.85;
-
 const BTW_OVERLAY_OPTIONS: OverlayOptions = {
-	anchor: "bottom-center",
-	width: "100%",
-	maxHeight: `${BTW_MAX_HEIGHT_RATIO * 100}%`,
-	margin: { left: 0, right: 0, bottom: 0 },
+	anchor: "center",
+	width: "90%",
+	maxHeight: "70%",
 };
 
-const SIDE_PAD = "  "; // 2-col left gutter for history, echo, footer
-const ANSWER_PAD = "    "; // 4-col left gutter for answer body (double of SIDE_PAD)
+const BTW_MAX_HEIGHT_RATIO = 0.7;
+const CHROME_LINES = 6;
+const MIN_VIEWPORT = 1;
+const MIN_CARD_WIDTH = 8;
+const CARD_PADDING = 4;
+
 const BTW_LITERAL = "/btw";
-const PENDING_GLYPH = "…";
+const BTW_STATUS_KEY = "btw";
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_INTERVAL_MS = 80;
+const STATUS_QUESTION_MAX_WIDTH = 60;
+
 const FOOTER_SCROLL = "↑/↓ to scroll";
 const FOOTER_CLEAR = "x to clear history";
 const FOOTER_DISMISS = "Esc to dismiss";
 const FOOTER_SEP = " · ";
 const MSG_TRIMMED = "context trimmed to fit budget";
 
-type Mode = "pending" | "answer" | "error";
+type Mode = "answer" | "error";
+
+const collapseWhitespace = (text: string): string => text.replace(/\s+/g, " ").trim();
+
+export function startBtwWaiting(
+	ctx: ExtensionCommandContext,
+	question: string,
+	controller: AbortController,
+): () => void {
+	const label = ctx.ui.theme.fg("accent", "btw");
+	const shortQuestion = truncateToWidth(
+		ctx.ui.theme.fg("muted", collapseWhitespace(question)),
+		STATUS_QUESTION_MAX_WIDTH,
+		ctx.ui.theme.fg("muted", "…"),
+		false,
+	);
+	let frame = 0;
+	const paint = (): void => {
+		ctx.ui.setStatus(BTW_STATUS_KEY, `${SPINNER_FRAMES[frame]} ${label} ${shortQuestion}`);
+	};
+	paint();
+	const timer = setInterval(() => {
+		frame = (frame + 1) % SPINNER_FRAMES.length;
+		paint();
+	}, SPINNER_INTERVAL_MS);
+	const unsubscribe = ctx.ui.onTerminalInput((data) => {
+		if (!matchesKey(data, Key.escape)) return undefined;
+		controller.abort();
+		return { consume: true };
+	});
+	let stopped = false;
+	return () => {
+		if (stopped) return;
+		stopped = true;
+		clearInterval(timer);
+		unsubscribe();
+		ctx.ui.setStatus(BTW_STATUS_KEY, undefined);
+	};
+}
 
 export interface ShowBtwOverlayParams {
 	ctx: ExtensionCommandContext;
 	question: string;
+	answer: string;
 	history: BtwTurn[];
 	controller: AbortController;
 	onClearHistory: () => void;
@@ -68,19 +89,22 @@ export interface ShowBtwOverlayParams {
 
 export interface ShowBtwOverlayResult {
 	overlayPromise: Promise<void>;
-	controllerReady: Promise<BtwOverlayController>;
+	controller: BtwOverlayController;
 }
 
 export class BtwOverlayController implements Component {
-	private mode: Mode = "pending";
-	private answer = "";
+	private mode: Mode = "answer";
 	private error = "";
 	private scrollOffset = 0;
+	private autoScroll = true;
+	private maxScroll = 0;
 	private trimmed = false;
 	private history: BtwTurn[];
+	private readonly markdown: Markdown;
 
 	constructor(
 		private readonly question: string,
+		answer: string,
 		history: BtwTurn[],
 		private readonly theme: Theme,
 		private readonly tui: TUI,
@@ -89,11 +113,12 @@ export class BtwOverlayController implements Component {
 		private readonly onClearHistory: () => void,
 	) {
 		this.history = [...history];
+		this.markdown = new Markdown(answer, 0, 0, getMarkdownTheme());
 	}
 
 	setAnswer(text: string): void {
 		this.mode = "answer";
-		this.answer = text;
+		this.markdown.setText(text);
 		this.tui.requestRender();
 	}
 
@@ -103,9 +128,6 @@ export class BtwOverlayController implements Component {
 		this.tui.requestRender();
 	}
 
-	// Orthogonal to mode: a trimmed result is also a successful answer.
-	// Idempotent; a fresh controller is built per /btw command in showBtwOverlay,
-	// so there is no reset path.
 	setTrimmed(): void {
 		this.trimmed = true;
 		this.tui.requestRender();
@@ -119,138 +141,101 @@ export class BtwOverlayController implements Component {
 		}
 		if (matchesKey(data, Key.up)) {
 			this.scrollOffset = Math.max(0, this.scrollOffset - 1);
+			this.autoScroll = false;
 			this.tui.requestRender();
 			return;
 		}
 		if (matchesKey(data, Key.down)) {
-			this.scrollOffset = this.scrollOffset + 1;
+			this.scrollOffset = Math.min(this.maxScroll, this.scrollOffset + 1);
+			this.autoScroll = this.scrollOffset >= this.maxScroll;
 			this.tui.requestRender();
 			return;
 		}
 		if (data === "x") {
 			this.history = [];
 			this.onClearHistory();
-			this.scrollOffset = 0;
+			this.autoScroll = true;
 			this.tui.requestRender();
-			return;
 		}
 	}
 
 	render(width: number): string[] {
-		const banner = this.renderBanner(width);
-		const historyLines = this.history.map((h) => this.historyLine(userMessageText(h.userMessage), width));
-		const echoLine = this.echoLine(this.question, width);
-		const answerLines = this.renderAnswer(width);
-		const footerAvail = Math.max(1, width - SIDE_PAD.length);
-		const footerParts: string[] = [];
-		if (this.mode !== "pending") footerParts.push(FOOTER_SCROLL);
-		if (this.history.length > 0) footerParts.push(FOOTER_CLEAR);
-		footerParts.push(FOOTER_DISMISS);
-		const footer =
-			SIDE_PAD + truncateToWidth(this.theme.fg("dim", footerParts.join(FOOTER_SEP)), footerAvail, "…", false);
+		if (width < MIN_CARD_WIDTH) return [];
+		const innerWidth = width - CARD_PADDING;
+		const row = (content: string): string =>
+			this.theme.fg("border", "│") +
+			" " +
+			truncateToWidth(content, innerWidth, "…", true) +
+			" " +
+			this.theme.fg("border", "│");
 
-		// Natural content: banner + blank + history + echo + blank + answer [+ trim notice] + blank + footer
-		const natural: string[] = [
-			banner,
-			"",
-			...historyLines,
-			echoLine,
-			"",
-			...answerLines,
-			...(this.trimmed
-				? [
-						ANSWER_PAD +
-							truncateToWidth(
-								this.theme.fg("warning", MSG_TRIMMED),
-								Math.max(1, width - ANSWER_PAD.length),
-								"…",
-								false,
-							),
-					]
-				: []),
-			"",
-			footer,
-		];
-
-		// Clip to terminal height if we overflow. Bottom-anchor keeps footer+answer visible;
-		// ↑/↓ scrolls the top (history) up into the clipped region.
-		const termRows = (this.tui.terminal as { rows?: number }).rows ?? 24;
-		const maxRows = Math.max(4, Math.floor(termRows * BTW_MAX_HEIGHT_RATIO));
-		if (natural.length <= maxRows) {
-			return natural;
-		}
-		const excess = natural.length - maxRows;
-		if (this.scrollOffset > excess) this.scrollOffset = excess;
-		// scrollOffset=0 shows the BOTTOM (newest). Scrolling up reveals older history.
-		const start = excess - this.scrollOffset;
-		return natural.slice(start, start + maxRows);
+		const content = this.contentLines(innerWidth);
+		const viewport = this.viewportHeight(content.length);
+		this.maxScroll = Math.max(0, content.length - viewport);
+		if (this.autoScroll) this.scrollOffset = this.maxScroll;
+		const start = Math.min(this.scrollOffset, this.maxScroll);
+		const visible = content.slice(start, start + viewport);
+		const divider = row(this.theme.fg("borderMuted", "─".repeat(innerWidth)));
+		const lines = [this.theme.fg("border", `╭${"─".repeat(width - 2)}╮`), row(this.titleLine(innerWidth)), divider];
+		for (let index = 0; index < viewport; index++) lines.push(row(visible[index] ?? ""));
+		lines.push(divider);
+		lines.push(row(this.footerLine(this.maxScroll > 0)));
+		lines.push(this.theme.fg("border", `╰${"─".repeat(width - 2)}╯`));
+		return lines;
 	}
 
 	invalidate(): void {
-		// no-op — render recomputes from state each cycle
+		this.markdown.invalidate();
 	}
 
-	private renderBanner(width: number): string {
-		const prefix = `${SIDE_PAD}${BTW_LITERAL} `;
-		const prefixWidth = visibleWidth(prefix);
-		const qAvail = Math.max(0, width - prefixWidth);
-		const qTrunc = truncateToWidth(this.question, qAvail, "…", false);
-		const raw = prefix + qTrunc;
-		const padded = raw + " ".repeat(Math.max(0, width - visibleWidth(raw)));
-		return this.theme.bg("customMessageBg", this.theme.fg("customMessageText", padded));
+	private viewportHeight(contentCount: number): number {
+		const terminalRows = (this.tui.terminal as { rows?: number }).rows ?? 24;
+		const maxRows = Math.floor(terminalRows * BTW_MAX_HEIGHT_RATIO);
+		const available = Math.max(MIN_VIEWPORT, maxRows - CHROME_LINES);
+		return Math.max(MIN_VIEWPORT, Math.min(contentCount, available));
 	}
 
-	private historyLine(question: string, width: number): string {
-		const qAvail = Math.max(0, width - SIDE_PAD.length);
-		const qClean = question.replace(/\s+/g, " ").trim();
-		const raw = `${BTW_LITERAL} ${qClean}`;
-		const trunc = truncateToWidth(raw, qAvail, "…", false);
-		return SIDE_PAD + this.theme.fg("muted", trunc);
+	private contentLines(innerWidth: number): string[] {
+		const lines = this.history.map((turn) =>
+			this.theme.fg("muted", `${BTW_LITERAL} ${collapseWhitespace(userMessageText(turn.userMessage))}`),
+		);
+		if (lines.length > 0) lines.push("");
+		lines.push(...this.answerLines(innerWidth));
+		if (this.trimmed) lines.push(this.theme.fg("warning", MSG_TRIMMED));
+		return lines;
 	}
 
-	private echoLine(question: string, width: number): string {
-		const bodyAvail = Math.max(1, width - SIDE_PAD.length);
-		const prefixWidth = visibleWidth(BTW_LITERAL) + 1; // "/btw "
-		const qAvail = Math.max(0, bodyAvail - prefixWidth);
-		const qClean = question.replace(/\s+/g, " ").trim();
-		const qTrunc = truncateToWidth(qClean, qAvail, "…", false);
-		return `${SIDE_PAD + this.theme.fg("accent", BTW_LITERAL)} ${this.theme.fg("muted", qTrunc)}`;
-	}
-
-	private wrapBodyLines(text: string, bodyWidth: number, colorFn?: (s: string) => string): string[] {
-		const out: string[] = [];
-		for (const ln of text.split("\n")) {
-			const src = ln.length === 0 ? " " : ln;
-			const colored = colorFn ? colorFn(src) : src;
-			out.push(...wrapTextWithAnsi(colored, bodyWidth));
-		}
-		return out;
-	}
-
-	private renderAnswer(width: number): string[] {
-		const bodyWidth = Math.max(1, width - ANSWER_PAD.length);
-		const indent = (lines: string[]) => lines.map((l) => ANSWER_PAD + l);
-
-		if (this.mode === "pending") {
-			return indent([this.theme.fg("warning", PENDING_GLYPH)]);
-		}
+	private answerLines(innerWidth: number): string[] {
 		if (this.mode === "error") {
-			return indent(this.wrapBodyLines(this.error, bodyWidth, (s) => this.theme.fg("error", s)));
+			return this.error
+				.split("\n")
+				.flatMap((line) => wrapTextWithAnsi(this.theme.fg("error", line || " "), innerWidth));
 		}
-		return indent(this.wrapBodyLines(this.answer, bodyWidth));
+		return this.markdown.render(innerWidth);
+	}
+
+	private titleLine(innerWidth: number): string {
+		const available = Math.max(0, innerWidth - visibleWidth(BTW_LITERAL) - 1);
+		const question = truncateToWidth(collapseWhitespace(this.question), available, "…", false);
+		return `${this.theme.fg("accent", BTW_LITERAL)} ${this.theme.bold(question)}`;
+	}
+
+	private footerLine(scrollable: boolean): string {
+		const parts: string[] = [];
+		if (scrollable) parts.push(FOOTER_SCROLL);
+		if (this.history.length > 0) parts.push(FOOTER_CLEAR);
+		parts.push(FOOTER_DISMISS);
+		return this.theme.fg("dim", parts.join(FOOTER_SEP));
 	}
 }
 
 export function showBtwOverlay(params: ShowBtwOverlayParams): ShowBtwOverlayResult {
-	let resolveReady!: (controller: BtwOverlayController) => void;
-	const controllerReady = new Promise<BtwOverlayController>((resolve) => {
-		resolveReady = resolve;
-	});
-
+	let controller!: BtwOverlayController;
 	const overlayPromise = params.ctx.ui.custom<void>(
 		(tui, theme, _kb, done) => {
-			const controller = new BtwOverlayController(
+			controller = new BtwOverlayController(
 				params.question,
+				params.answer,
 				params.history,
 				theme,
 				tui,
@@ -258,11 +243,9 @@ export function showBtwOverlay(params: ShowBtwOverlayParams): ShowBtwOverlayResu
 				params.controller,
 				params.onClearHistory,
 			);
-			resolveReady(controller);
 			return controller;
 		},
 		{ overlay: true, overlayOptions: BTW_OVERLAY_OPTIONS },
 	);
-
-	return { overlayPromise, controllerReady };
+	return { overlayPromise, controller };
 }

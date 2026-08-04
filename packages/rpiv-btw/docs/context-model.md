@@ -1,12 +1,12 @@
 # What `/btw` sends to the model
 
 Exactly what every `/btw` call puts in front of your primary model, where each
-piece comes from, and what is guaranteed never to leave the panel.
+piece comes from, and what is guaranteed never to leave the card.
 
 ## The request
 
-Each `/btw` call is a single non-streaming completion against `ctx.model` — the
-same primary model driving your session. There is no model picker and no
+Each `/btw` call is a single streamed request against `ctx.model`, the same
+primary model driving your session. There is no model picker and no
 lighter-weight side model.
 
 | Part | Value |
@@ -49,8 +49,8 @@ and every later `/btw` call in the same session replays that history between the
 branch clone and your new question. Follow-ups therefore work: the side thread
 has its own memory.
 
-History stores the **actual** `UserMessage` and `AssistantMessage` object
-references returned by the call — nothing is reconstructed or re-serialised.
+History stores the **actual** `UserMessage` and terminal `AssistantMessage`
+object references returned by the stream. Nothing is reconstructed or re-serialised.
 Concatenated in a fixed order, this keeps the prompt prefix byte-identical
 across calls, so provider-side prompt caching keeps hitting.
 
@@ -79,13 +79,13 @@ whitespace-collapsed and truncated to 200 characters.
 - answer directly and concisely, in compact bullets or short paragraphs;
 - cite files, functions, and line numbers when grounding a claim in the context;
 - say so briefly when the context is insufficient, rather than guessing;
-- use no tools and reply in plain text only, even if prior assistant turns in the
-  context demonstrate tool use.
+- use no tools, even if prior assistant turns in the context demonstrate tool use;
+- use Markdown when it improves clarity.
 
 ## What never happens
 
-- **No transcript entry.** The answer is rendered through `ctx.ui.custom` as an
-  overlay component. It is never emitted as an agent message.
+- **No transcript entry.** The wait uses `ctx.ui.setStatus`, and the answer uses
+  `ctx.ui.custom`. Neither path emits an agent message.
 - **No disk writes.** History and snapshots live on `globalThis[Symbol.for("rpiv-btw")]`.
   The package's only filesystem access is one read of its own bundled prompt file
   at module init.

@@ -11,7 +11,7 @@ rpiv-btw/
 ├── btw.ts               — state, snapshots, threading, the model call
 ├── btw-budget.ts        — history cap + branch fit
 ├── btw-messages.ts      — BtwTurn + message-text extractors
-├── btw-ui.ts            — bottom-anchored overlay and key handling
+├── btw-ui.ts            — footer wait status, centered card, and key handling
 ├── pi-compat.ts         — host-tolerant pi-ai /compat loaders
 └── prompts/btw-system.txt — system prompt for the side call
 ```
@@ -62,58 +62,66 @@ cross-import-graph singletons) means the cell survives module re-import, so
 when the Pi process exits — by design. Nothing is persisted to disk, and the
 package reads no environment variables and no config files.
 
-## Overlay
+## Footer wait and centered card
 
-`showBtwOverlay` mounts a `Component` through `ctx.ui.custom` with these options:
+Before the first token, `startBtwWaiting` writes `⠋ btw <question>` through
+`ctx.ui.setStatus`. A timer advances the braille frame every 80 milliseconds.
+The question uses the muted theme color and stops at 60 columns.
+
+The wait does not take focus. A temporary `ctx.ui.onTerminalInput` listener
+consumes `Esc` and aborts the side call. Cleanup removes the listener, timer,
+and status on every completion path.
+
+The first text delta opens `showBtwOverlay`. It mounts a `Component` through
+`ctx.ui.custom` with these options:
 
 | Option | Value |
 | --- | --- |
-| `anchor` | `bottom-center` |
-| `width` | `100%` |
-| `maxHeight` | `85%` (`BTW_MAX_HEIGHT_RATIO = 0.85`) |
-| `margin` | `{ left: 0, right: 0, bottom: 0 }` |
+| `anchor` | `center` |
+| `width` | `90%` |
+| `maxHeight` | `70%` (`BTW_MAX_HEIGHT_RATIO = 0.7`) |
 
 Render order, top to bottom:
 
 ```
-banner        — your question on a themed stripe, padded to full width
-(blank)
+top border
+title         — "/btw <question>"
+divider
 history       — prior "/btw <q>" lines for this session
-echo          — "/btw <q>" for the current question
-(blank)
-answer        — "…" while pending, the answer text, or the error in red
-(blank)
+answer        — Pi Markdown output, or an error in red
+trim notice   — only when context budgeting dropped content
+divider
 footer        — key hints
+bottom border
 ```
 
-History and echo use a 2-column left gutter; the answer body uses 4. The panel
-grows upward with content. When the natural height exceeds
-`floor(terminalRows × 0.85)` (terminal rows default to 24 if unknown, with a
-floor of 4 rows), it clips from the top and `↑`/`↓` scroll that window —
-offset `0` shows the newest content.
+The card follows its content height. When content exceeds
+`floor(terminalRows × 0.7)`, the chrome stays fixed and the body scrolls.
+Streaming follows the newest content until the user scrolls up. Pi's `Markdown`
+component receives each accumulated text update through `setText()`.
 
 ### Keys and footer gates
 
 | Key | Action | Matching |
 | --- | --- | --- |
 | `Esc` | Aborts the in-flight call and dismisses the overlay | `matchesKey` (ANSI + Kitty) |
-| `↑` | Scroll up one row, clamped at 0 | `matchesKey` |
-| `↓` | Scroll down one row, clamped to the overflow amount | `matchesKey` |
+| `↑` | Scroll up one row and stop automatic tail-following | `matchesKey` |
+| `↓` | Scroll down one row and resume tail-following at the bottom | `matchesKey` |
 | `x` | Clears this session's `/btw` history and resets scroll | raw `data === "x"` — uppercase `X` is not bound |
 
 | Footer hint | Shown when |
 | --- | --- |
-| `↑/↓ to scroll` | the call is no longer pending (an answer or error has arrived) |
+| `↑/↓ to scroll` | the body exceeds the card height cap |
 | `x to clear history` | this session has at least one prior `/btw` turn |
 | `Esc to dismiss` | always |
 
-Hints are joined with `" · "` and truncated to the panel width.
+Hints are joined with `" · "` and truncated to the card width.
 
 ## Host-version tolerance
 
 pi-ai resolves at runtime against the *host's* copy (all three pi peers are
 declared `"*"`), and pi moved the global dispatch API to a `/compat` entrypoint
-in 0.80.1. `pi-compat.ts` therefore resolves `completeSimple` lazily:
+in 0.80.1. `pi-compat.ts` therefore resolves `streamSimple` lazily:
 
 1. `import("@earendil-works/pi-ai/compat")` — pi >= 0.80.1.
 2. On a **module-resolution** failure only, fall back to
@@ -128,7 +136,7 @@ init — rethrows, so a real failure surfaces instead of being masked by a root
 import that may not have the export.
 
 If neither entrypoint exposes the function, the call fails with
-`pi-ai does not expose completeSimple on /compat or the package root — unsupported host pi-ai version`.
+`pi-ai does not expose streamSimple on /compat or the package root — unsupported host pi-ai version`.
 
 `/compat` is documented upstream as temporary, so this module is the single place
 to migrate when it is removed.
@@ -144,12 +152,13 @@ Every notify and overlay error string the package can produce:
 | `/btw requires an active model` (error) | there is no `ctx.model` |
 | `/btw model (<provider>:<id>) is misconfigured: <err>` | credential lookup returned an error |
 | `/btw model (<provider>:<id>) has no API key available.` | lookup succeeded but the API key is empty |
-| `/btw call failed: <err ?? "unknown error">` | the completion returned `stopReason: "error"` |
-| `/btw call threw: <message>` | the completion threw and the call was not aborted |
+| `/btw call failed: <err ?? "unknown error">` | the stream ended with `stopReason: "error"` |
+| `/btw call threw: <message>` | the stream threw, or ended without a terminal event, and the call was not aborted |
 | `/btw returned no text content.` | the response contained no text parts |
 
-The first three are `ctx.ui.notify` toasts raised before the overlay opens; the
-rest render inside the overlay in the error style.
+The first three are `ctx.ui.notify` toasts raised before the call starts. A call
+error before the first token is also a toast. An error after a token renders in
+the open card.
 
 ## Boundaries
 

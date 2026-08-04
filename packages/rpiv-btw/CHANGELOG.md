@@ -7,6 +7,13 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Stream `/btw` answers from the first token and render them with Pi's Markdown component.
+
+### Changed
+- Move the empty wait into Pi's footer status line as an animated `⠋ btw <question>` status. `Esc` still cancels before the card opens.
+- Replace the full-width bottom panel with a bordered card centered at 90% width. The card follows content height, caps at 70% of the terminal, and scrolls internally.
+
 ## [2.5.0] - 2026-08-13
 
 ## [2.4.0] - 2026-08-03

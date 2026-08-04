@@ -19,7 +19,7 @@
 import type { AssistantMessage, UserMessage } from "@earendil-works/pi-ai";
 
 // Real messages — no fabrication. userMessage is built at call time; assistantMessage
-// is the unmodified completeSimple response. Stable object references across calls →
+// is the unmodified terminal stream response. Stable object references across calls →
 // byte-identical prompt prefix on subsequent /btw invocations (cache parity).
 export interface BtwTurn {
 	userMessage: UserMessage;

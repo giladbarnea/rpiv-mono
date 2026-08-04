@@ -15,27 +15,24 @@ vi.mock("@earendil-works/pi-ai", async (importOriginal) => {
 	};
 });
 
-// completeSimple lives on /compat since pi 0.80 (see test/setup.ts).
+// streamSimple lives on /compat since pi 0.80 (see test/setup.ts).
 vi.mock("@earendil-works/pi-ai/compat", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("@earendil-works/pi-ai/compat")>();
 	return {
 		...actual,
-		completeSimple: vi.fn(),
+		streamSimple: vi.fn(),
 	};
 });
 
 // Mock the loader so the overflow gate is controllable independently of the
-// real isContextOverflow regex behavior. loadCompleteSimple is routed to the
-// shared completeSimple spy (above) so existing mockResolvedValueOnce chains
-// keep working; loadIsContextOverflow defaults to undefined (legacy host, no
-// retry) and is overridden per-test in the overflow-retry suite.
+// real isContextOverflow regex behavior.
 vi.mock("./pi-compat.js", () => ({
-	loadCompleteSimple: vi.fn(),
+	loadStreamSimple: vi.fn(),
 	loadIsContextOverflow: vi.fn(),
 }));
 
 import type { AssistantMessage, UserMessage } from "@earendil-works/pi-ai";
-import { completeSimple } from "@earendil-works/pi-ai/compat";
+import { streamSimple } from "@earendil-works/pi-ai/compat";
 import {
 	assistantMessageText,
 	BTW_STATE_KEY,
@@ -51,7 +48,7 @@ import {
 	registerMessageEndSnapshot,
 	userMessageText,
 } from "./btw.js";
-import { loadCompleteSimple, loadIsContextOverflow } from "./pi-compat.js";
+import { loadIsContextOverflow, loadStreamSimple } from "./pi-compat.js";
 
 // Pins the substring `isStaleCtxError` matches in pi-core's invalidated-proxy error.
 const STALE_CTX_MESSAGE = "This extension ctx is stale after session replacement or reload.";
@@ -70,13 +67,27 @@ function makeCompletionResponse(input: {
 	} as unknown as AssistantMessage;
 }
 
+function makeCompletionStream(input: Parameters<typeof makeCompletionResponse>[0], deltas?: string[]) {
+	const response = makeCompletionResponse(input);
+	return {
+		async *[Symbol.asyncIterator]() {
+			for (const delta of deltas ?? (input.text ? [input.text] : [])) {
+				yield { type: "text_delta", delta };
+			}
+			if (response.stopReason === "error") {
+				yield { type: "error", error: response };
+				return;
+			}
+			yield { type: "done", message: response };
+		},
+	};
+}
+
 beforeEach(() => {
-	vi.mocked(completeSimple).mockReset();
-	vi.mocked(loadCompleteSimple).mockReset();
+	vi.mocked(streamSimple).mockReset();
+	vi.mocked(loadStreamSimple).mockReset();
 	vi.mocked(loadIsContextOverflow).mockReset();
-	// Route the loader to the shared completeSimple spy so existing
-	// mockResolvedValueOnce(makeCompletionResponse(...)) chains keep working.
-	vi.mocked(loadCompleteSimple).mockResolvedValue(completeSimple as never);
+	vi.mocked(loadStreamSimple).mockResolvedValue(streamSimple as never);
 	// Default: legacy host (isContextOverflow absent) → no retry. Per-test
 	// overrides set a real overflowFn to exercise the gate.
 	vi.mocked(loadIsContextOverflow).mockResolvedValue(undefined);
@@ -146,7 +157,7 @@ describe("BTW_SYSTEM_PROMPT + BTW_STATE_KEY + CROSS_SESSION_HINT_LIMIT", () => {
 describe("clearSessionHistory + invalidateSnapshot", () => {
 	it("clearSessionHistory resets per-session history list", async () => {
 		const ctx = createMockCtx();
-		vi.mocked(completeSimple).mockResolvedValueOnce(makeCompletionResponse({ text: "answer" }) as never);
+		vi.mocked(streamSimple).mockReturnValueOnce(makeCompletionStream({ text: "answer" }) as never);
 		ctx.model = { provider: "anthropic", id: "sonnet-4.6" } as never;
 		await executeBtw("q", ctx, new AbortController());
 		clearSessionHistory(ctx);
@@ -166,10 +177,37 @@ describe("clearSessionHistory + invalidateSnapshot", () => {
 });
 
 describe("executeBtw — ok path", () => {
+	it("streams accumulated text and keeps the final assistant message", async () => {
+		const ctx = createMockCtx();
+		ctx.model = { provider: "a", id: "m" } as never;
+		const finalMessage = makeCompletionResponse({ text: "answer text" });
+		vi.mocked(streamSimple).mockReturnValueOnce({
+			async *[Symbol.asyncIterator]() {
+				yield { type: "text_delta", delta: "answer" };
+				yield { type: "text_delta", delta: " text" };
+				yield { type: "done", message: finalMessage };
+			},
+		} as never);
+		const streamed: string[] = [];
+		const run = executeBtw as unknown as (
+			question: string,
+			context: typeof ctx,
+			controller: AbortController,
+			onText: (text: string) => void,
+		) => ReturnType<typeof executeBtw>;
+
+		const result = await run("question", ctx, new AbortController(), (text) => streamed.push(text));
+
+		expect(streamed).toEqual(["answer", "answer text"]);
+		expect(result).toMatchObject({ kind: "success", answer: "answer text" });
+		if (result.kind !== "success") throw new Error("unexpected");
+		expect(result.assistantMessage).toBe(finalMessage);
+	});
+
 	it("returns ok=true with answer + userMessage + assistantMessage", async () => {
 		const ctx = createMockCtx();
 		ctx.model = { provider: "a", id: "m" } as never;
-		vi.mocked(completeSimple).mockResolvedValueOnce(makeCompletionResponse({ text: "answer text" }) as never);
+		vi.mocked(streamSimple).mockReturnValueOnce(makeCompletionStream({ text: "answer text" }) as never);
 		const r = await executeBtw("question", ctx, new AbortController());
 		expect(r.kind).toBe("success");
 		if (r.kind !== "success") throw new Error("unexpected");
@@ -214,15 +252,15 @@ describe("executeBtw — error branches", () => {
 	it("returns aborted when stopReason=aborted", async () => {
 		const ctx = createMockCtx();
 		ctx.model = { provider: "a", id: "m" } as never;
-		vi.mocked(completeSimple).mockResolvedValueOnce(makeCompletionResponse({ stopReason: "aborted" }) as never);
+		vi.mocked(streamSimple).mockReturnValueOnce(makeCompletionStream({ stopReason: "aborted" }) as never);
 		const r = await executeBtw("q", ctx, new AbortController());
 		expect(r).toMatchObject({ kind: "aborted" });
 	});
 	it("returns error when stopReason=error", async () => {
 		const ctx = createMockCtx();
 		ctx.model = { provider: "a", id: "m" } as never;
-		vi.mocked(completeSimple).mockResolvedValueOnce(
-			makeCompletionResponse({ stopReason: "error", errorMessage: "remote 500" }) as never,
+		vi.mocked(streamSimple).mockReturnValueOnce(
+			makeCompletionStream({ stopReason: "error", errorMessage: "remote 500" }) as never,
 		);
 		const r = await executeBtw("q", ctx, new AbortController());
 		expect(r.kind).toBe("error");
@@ -232,7 +270,7 @@ describe("executeBtw — error branches", () => {
 	it("returns error when response has no text content", async () => {
 		const ctx = createMockCtx();
 		ctx.model = { provider: "a", id: "m" } as never;
-		vi.mocked(completeSimple).mockResolvedValueOnce(makeCompletionResponse({ stopReason: "done" }) as never);
+		vi.mocked(streamSimple).mockReturnValueOnce(makeCompletionStream({ stopReason: "done" }) as never);
 		const r = await executeBtw("q", ctx, new AbortController());
 		expect(r.kind).toBe("error");
 		if (r.kind !== "error") throw new Error("unexpected");
@@ -243,19 +281,35 @@ describe("executeBtw — error branches", () => {
 		ctx.model = { provider: "a", id: "m" } as never;
 		const controller = new AbortController();
 		controller.abort();
-		vi.mocked(completeSimple).mockRejectedValueOnce(new Error("abort"));
+		vi.mocked(streamSimple).mockImplementationOnce(() => {
+			throw new Error("abort");
+		});
 		const r = await executeBtw("q", ctx, controller);
 		expect(r).toMatchObject({ kind: "aborted" });
 	});
 	it("wraps unknown throws as errCallThrew", async () => {
 		const ctx = createMockCtx();
 		ctx.model = { provider: "a", id: "m" } as never;
-		vi.mocked(completeSimple).mockRejectedValueOnce(new Error("boom"));
+		vi.mocked(streamSimple).mockImplementationOnce(() => {
+			throw new Error("boom");
+		});
 		const r = await executeBtw("q", ctx, new AbortController());
 		expect(r.kind).toBe("error");
 		if (r.kind !== "error") throw new Error("unexpected");
 		expect(r.error).toContain("call threw");
 		expect(r.error).toContain("boom");
+	});
+
+	it("reports a stream that ends without a terminal event", async () => {
+		const ctx = createMockCtx();
+		ctx.model = { provider: "a", id: "m" } as never;
+		vi.mocked(streamSimple).mockReturnValueOnce({
+			async *[Symbol.asyncIterator]() {},
+		} as never);
+
+		const result = await executeBtw("q", ctx, new AbortController());
+
+		expect(result).toEqual({ kind: "error", error: "/btw call threw: stream ended without a final message" });
 	});
 });
 
@@ -264,13 +318,13 @@ describe("executeBtw — cross-session hint", () => {
 		const ctx = createMockCtx();
 		ctx.model = { provider: "a", id: "m" } as never;
 
-		vi.mocked(completeSimple).mockResolvedValueOnce(makeCompletionResponse({ text: "first" }) as never);
+		vi.mocked(streamSimple).mockReturnValueOnce(makeCompletionStream({ text: "first" }) as never);
 		await executeBtw("first-question", ctx, new AbortController());
 
-		vi.mocked(completeSimple).mockImplementationOnce((async (_model: unknown, req: { systemPrompt: string }) => {
+		vi.mocked(streamSimple).mockImplementationOnce(((_model: unknown, req: { systemPrompt: string }) => {
 			expect(req.systemPrompt).toContain("## Recent /btw questions across sessions");
 			expect(req.systemPrompt).toContain("first-question");
-			return makeCompletionResponse({ text: "second" });
+			return makeCompletionStream({ text: "second" });
 		}) as never);
 		await executeBtw("second-question", ctx, new AbortController());
 	});
@@ -278,15 +332,15 @@ describe("executeBtw — cross-session hint", () => {
 		const ctx = createMockCtx();
 		ctx.model = { provider: "a", id: "m" } as never;
 		for (let i = 0; i < 12; i++) {
-			vi.mocked(completeSimple).mockResolvedValueOnce(makeCompletionResponse({ text: `a${i}` }) as never);
+			vi.mocked(streamSimple).mockReturnValueOnce(makeCompletionStream({ text: `a${i}` }) as never);
 			await executeBtw(`q${i}`, ctx, new AbortController());
 		}
-		vi.mocked(completeSimple).mockImplementationOnce((async (_m: unknown, req: { systemPrompt: string }) => {
+		vi.mocked(streamSimple).mockImplementationOnce(((_m: unknown, req: { systemPrompt: string }) => {
 			const lines = req.systemPrompt.match(/^\d+\. /gm) ?? [];
 			expect(lines.length).toBe(10);
 			expect(req.systemPrompt).toContain("q11");
 			expect(req.systemPrompt).not.toContain("q0.");
-			return makeCompletionResponse({ text: "ok" });
+			return makeCompletionStream({ text: "ok" });
 		}) as never);
 		await executeBtw("final", ctx, new AbortController());
 	});
@@ -298,12 +352,12 @@ describe("executeBtw — branch threading", () => {
 			branch: buildSessionEntries([makeUserMessage("earlier user turn")]),
 		});
 		ctx.model = { provider: "a", id: "m" } as never;
-		vi.mocked(completeSimple).mockImplementationOnce((async (_m: unknown, req: { messages: unknown[] }) => {
+		vi.mocked(streamSimple).mockImplementationOnce(((_m: unknown, req: { messages: unknown[] }) => {
 			expect(req.messages[0]).toMatchObject({
 				role: "user",
 				content: [{ type: "text", text: "earlier user turn" }],
 			});
-			return makeCompletionResponse({ text: "ok" });
+			return makeCompletionStream({ text: "ok" });
 		}) as never);
 		await executeBtw("q", ctx, new AbortController());
 	});
@@ -366,26 +420,44 @@ describe("buildBtwMessages — history cap engagement", () => {
 });
 
 describe("executeBtw — overflow retry", () => {
+	it("replaces the first attempt's partial text with retry text", async () => {
+		const ctx = createMockCtx();
+		ctx.model = { provider: "a", id: "m", contextWindow: 8192 } as never;
+		vi.mocked(loadIsContextOverflow).mockResolvedValue(vi.fn(() => true) as never);
+		vi.mocked(streamSimple)
+			.mockReturnValueOnce(
+				makeCompletionStream({ stopReason: "error", errorMessage: "prompt is too long" }, [
+					"first partial",
+				]) as never,
+			)
+			.mockReturnValueOnce(makeCompletionStream({ text: "retry answer" }, ["retry answer"]) as never);
+		const streamed: string[] = [];
+
+		await executeBtw("q", ctx, new AbortController(), (text) => streamed.push(text));
+
+		expect(streamed).toEqual(["first partial", "retry answer"]);
+	});
+
 	it("retries exactly once on first-call overflow, then succeeds with the retry's answer", async () => {
 		const ctx = createMockCtx();
 		ctx.model = { provider: "a", id: "m", contextWindow: 8192 } as never;
 		const overflowFn = vi.fn(() => true);
 		vi.mocked(loadIsContextOverflow).mockResolvedValue(overflowFn as never);
-		vi.mocked(completeSimple)
-			.mockResolvedValueOnce(
-				makeCompletionResponse({ stopReason: "error", errorMessage: "prompt is too long" }) as never,
+		vi.mocked(streamSimple)
+			.mockReturnValueOnce(
+				makeCompletionStream({ stopReason: "error", errorMessage: "prompt is too long" }) as never,
 			)
-			.mockResolvedValueOnce(makeCompletionResponse({ text: "retry answer" }) as never);
+			.mockReturnValueOnce(makeCompletionStream({ text: "retry answer" }) as never);
 
 		const r = await executeBtw("q", ctx, new AbortController());
 
 		expect(r.kind).toBe("success");
 		if (r.kind !== "success") throw new Error("unexpected");
 		expect(r.answer).toBe("retry answer");
-		expect(completeSimple).toHaveBeenCalledTimes(2);
+		expect(streamSimple).toHaveBeenCalledTimes(2);
 		// The retry rebuilt the context: the second call received a freshly built
 		// messages array (buildBtwMessages returns a new spread each call).
-		const calls = vi.mocked(completeSimple).mock.calls as Array<[unknown, { messages: unknown[] }, unknown]>;
+		const calls = vi.mocked(streamSimple).mock.calls as Array<[unknown, { messages: unknown[] }, unknown]>;
 		expect(calls[1][1].messages).not.toBe(calls[0][1].messages);
 	});
 
@@ -394,12 +466,12 @@ describe("executeBtw — overflow retry", () => {
 		ctx.model = { provider: "a", id: "m", contextWindow: 8192 } as never;
 		const overflowFn = vi.fn(() => true);
 		vi.mocked(loadIsContextOverflow).mockResolvedValue(overflowFn as never);
-		vi.mocked(completeSimple).mockResolvedValueOnce(makeCompletionResponse({ stopReason: "aborted" }) as never);
+		vi.mocked(streamSimple).mockReturnValueOnce(makeCompletionStream({ stopReason: "aborted" }) as never);
 
 		const r = await executeBtw("q", ctx, new AbortController());
 
 		expect(r).toMatchObject({ kind: "aborted" });
-		expect(completeSimple).toHaveBeenCalledTimes(1);
+		expect(streamSimple).toHaveBeenCalledTimes(1);
 		expect(overflowFn).not.toHaveBeenCalled();
 	});
 
@@ -407,28 +479,28 @@ describe("executeBtw — overflow retry", () => {
 		const ctx = createMockCtx();
 		ctx.model = { provider: "a", id: "m", contextWindow: 8192 } as never;
 		vi.mocked(loadIsContextOverflow).mockResolvedValue(vi.fn(() => true) as never);
-		vi.mocked(completeSimple)
-			.mockResolvedValueOnce(
-				makeCompletionResponse({ stopReason: "error", errorMessage: "prompt is too long" }) as never,
+		vi.mocked(streamSimple)
+			.mockReturnValueOnce(
+				makeCompletionStream({ stopReason: "error", errorMessage: "prompt is too long" }) as never,
 			)
-			.mockResolvedValueOnce(makeCompletionResponse({ stopReason: "aborted" }) as never);
+			.mockReturnValueOnce(makeCompletionStream({ stopReason: "aborted" }) as never);
 
 		const r = await executeBtw("q", ctx, new AbortController());
 
 		expect(r).toMatchObject({ kind: "aborted" });
-		expect(completeSimple).toHaveBeenCalledTimes(2);
+		expect(streamSimple).toHaveBeenCalledTimes(2);
 	});
 
 	it("falls through to the error arm when the retry also overflows (no third call)", async () => {
 		const ctx = createMockCtx();
 		ctx.model = { provider: "a", id: "m", contextWindow: 8192 } as never;
 		vi.mocked(loadIsContextOverflow).mockResolvedValue(vi.fn(() => true) as never);
-		vi.mocked(completeSimple)
-			.mockResolvedValueOnce(
-				makeCompletionResponse({ stopReason: "error", errorMessage: "prompt is too long" }) as never,
+		vi.mocked(streamSimple)
+			.mockReturnValueOnce(
+				makeCompletionStream({ stopReason: "error", errorMessage: "prompt is too long" }) as never,
 			)
-			.mockResolvedValueOnce(
-				makeCompletionResponse({ stopReason: "error", errorMessage: "prompt is too long" }) as never,
+			.mockReturnValueOnce(
+				makeCompletionStream({ stopReason: "error", errorMessage: "prompt is too long" }) as never,
 			);
 
 		const r = await executeBtw("q", ctx, new AbortController());
@@ -436,15 +508,15 @@ describe("executeBtw — overflow retry", () => {
 		expect(r.kind).toBe("error");
 		if (r.kind !== "error") throw new Error("unexpected");
 		expect(r.error).toContain("call failed");
-		expect(completeSimple).toHaveBeenCalledTimes(2);
+		expect(streamSimple).toHaveBeenCalledTimes(2);
 	});
 
 	it("does not retry on a non-overflow error (overflowFn returns false)", async () => {
 		const ctx = createMockCtx();
 		ctx.model = { provider: "a", id: "m", contextWindow: 8192 } as never;
 		vi.mocked(loadIsContextOverflow).mockResolvedValue(vi.fn(() => false) as never);
-		vi.mocked(completeSimple).mockResolvedValueOnce(
-			makeCompletionResponse({ stopReason: "error", errorMessage: "remote 500" }) as never,
+		vi.mocked(streamSimple).mockReturnValueOnce(
+			makeCompletionStream({ stopReason: "error", errorMessage: "remote 500" }) as never,
 		);
 
 		const r = await executeBtw("q", ctx, new AbortController());
@@ -452,7 +524,7 @@ describe("executeBtw — overflow retry", () => {
 		expect(r.kind).toBe("error");
 		if (r.kind !== "error") throw new Error("unexpected");
 		expect(r.error).toContain("remote 500");
-		expect(completeSimple).toHaveBeenCalledTimes(1);
+		expect(streamSimple).toHaveBeenCalledTimes(1);
 	});
 
 	it("does not retry on a legacy host where isContextOverflow is absent (undefined)", async () => {
@@ -460,8 +532,8 @@ describe("executeBtw — overflow retry", () => {
 		ctx.model = { provider: "a", id: "m", contextWindow: 8192 } as never;
 		vi.mocked(loadIsContextOverflow).mockResolvedValue(undefined);
 		// Even an overflow-looking error does not trigger a retry.
-		vi.mocked(completeSimple).mockResolvedValueOnce(
-			makeCompletionResponse({ stopReason: "error", errorMessage: "prompt is too long" }) as never,
+		vi.mocked(streamSimple).mockReturnValueOnce(
+			makeCompletionStream({ stopReason: "error", errorMessage: "prompt is too long" }) as never,
 		);
 
 		const r = await executeBtw("q", ctx, new AbortController());
@@ -469,7 +541,7 @@ describe("executeBtw — overflow retry", () => {
 		expect(r.kind).toBe("error");
 		if (r.kind !== "error") throw new Error("unexpected");
 		expect(r.error).toContain("call failed");
-		expect(completeSimple).toHaveBeenCalledTimes(1);
+		expect(streamSimple).toHaveBeenCalledTimes(1);
 	});
 });
 
