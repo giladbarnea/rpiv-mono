@@ -436,8 +436,12 @@ async function handleBtwCommand(_pi: ExtensionAPI, args: string, ctx: ExtensionC
 		return shown.controller;
 	};
 
-	const result = await executeBtw(question, ctx, controller, showAnswer);
-	stopWaiting();
+	let result: BtwExecResult;
+	try {
+		result = await executeBtw(question, ctx, controller, showAnswer);
+	} finally {
+		stopWaiting();
+	}
 
 	switch (result.kind) {
 		case "success": {

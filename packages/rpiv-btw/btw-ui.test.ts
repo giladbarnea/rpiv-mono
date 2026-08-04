@@ -90,6 +90,31 @@ describe("startBtwWaiting", () => {
 		expect(setStatus).toHaveBeenLastCalledWith("btw", undefined);
 	});
 
+	it("continues and stops after the command context becomes stale", () => {
+		vi.useFakeTimers();
+		const setStatus = vi.fn();
+		const unsubscribe = vi.fn();
+		const ui = {
+			theme: identityTheme,
+			setStatus,
+			onTerminalInput: vi.fn(() => unsubscribe),
+		};
+		let stale = false;
+		const ctx = {
+			get ui() {
+				if (stale) throw new Error("stale command context");
+				return ui;
+			},
+		} as never;
+		const stop = startBtwWaiting(ctx, "what is this?", new AbortController());
+
+		stale = true;
+		expect(() => vi.advanceTimersByTime(80)).not.toThrow();
+		expect(() => stop()).not.toThrow();
+		expect(unsubscribe).toHaveBeenCalledTimes(1);
+		expect(setStatus).toHaveBeenLastCalledWith("btw", undefined);
+	});
+
 	it("caps the question at 60 columns and ignores other keys", () => {
 		let inputListener: ((data: string) => unknown) | undefined;
 		const setStatus = vi.fn();

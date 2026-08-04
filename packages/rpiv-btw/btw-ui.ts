@@ -47,23 +47,24 @@ export function startBtwWaiting(
 	question: string,
 	controller: AbortController,
 ): () => void {
-	const label = ctx.ui.theme.fg("accent", "btw");
+	const ui = ctx.ui;
+	const label = ui.theme.fg("accent", "btw");
 	const shortQuestion = truncateToWidth(
-		ctx.ui.theme.fg("muted", collapseWhitespace(question)),
+		ui.theme.fg("muted", collapseWhitespace(question)),
 		STATUS_QUESTION_MAX_WIDTH,
-		ctx.ui.theme.fg("muted", "…"),
+		ui.theme.fg("muted", "…"),
 		false,
 	);
 	let frame = 0;
 	const paint = (): void => {
-		ctx.ui.setStatus(BTW_STATUS_KEY, `${SPINNER_FRAMES[frame]} ${label} ${shortQuestion}`);
+		ui.setStatus(BTW_STATUS_KEY, `${SPINNER_FRAMES[frame]} ${label} ${shortQuestion}`);
 	};
 	paint();
 	const timer = setInterval(() => {
 		frame = (frame + 1) % SPINNER_FRAMES.length;
 		paint();
 	}, SPINNER_INTERVAL_MS);
-	const unsubscribe = ctx.ui.onTerminalInput((data) => {
+	const unsubscribe = ui.onTerminalInput((data) => {
 		if (!matchesKey(data, Key.escape)) return undefined;
 		controller.abort();
 		return { consume: true };
@@ -74,7 +75,7 @@ export function startBtwWaiting(
 		stopped = true;
 		clearInterval(timer);
 		unsubscribe();
-		ctx.ui.setStatus(BTW_STATUS_KEY, undefined);
+		ui.setStatus(BTW_STATUS_KEY, undefined);
 	};
 }
 

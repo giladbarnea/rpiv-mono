@@ -169,6 +169,17 @@ describe("/btw — aborted", () => {
 });
 
 describe("/btw — executor failure", () => {
+	it("stops the footer wait when the command rejects", async () => {
+		const stopWaiting = vi.fn();
+		vi.mocked(startBtwWaiting).mockReturnValueOnce(stopWaiting);
+		const cmd = register();
+		const ctx = createMockCtx({ hasUI: true, model });
+		vi.mocked(ctx.modelRegistry.getApiKeyAndHeaders).mockRejectedValueOnce(new Error("stale command context"));
+
+		await expect(cmd.handler("q", ctx as never)).rejects.toThrow("stale command context");
+		expect(stopWaiting).toHaveBeenCalledTimes(1);
+	});
+
 	it("notifies an error that arrives before the first token", async () => {
 		vi.mocked(streamSimple).mockReturnValueOnce(
 			streamTerminal({
