@@ -2,8 +2,8 @@
  * @juicesharp/rpiv-btw — /btw side-question slash command.
  *
  * Asks the same primary model a one-off side question using the cloned primary
- * conversation as context. Answer is rendered ephemerally in a bottom-slot
- * overlay (never enters main agent's messages). History persists per-session-file
+ * conversation as context. Answer streams into an ephemeral centered card
+ * (never enters main agent's messages). History persists per-session-file
  * via globalThis-keyed storage; process-scoped only (no disk persistence).
  */
 
@@ -19,8 +19,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { type CappedHistory, capHistory, type FitBranchResult, fitBranch } from "./btw-budget.js";
 import { assistantMessageText, type BtwTurn, userMessageText } from "./btw-messages.js";
-import { showBtwOverlay } from "./btw-ui.js";
-import { loadCompleteSimple, loadIsContextOverflow } from "./pi-compat.js";
+import { type BtwOverlayController, showBtwOverlay, startBtwWaiting } from "./btw-ui.js";
+import { loadIsContextOverflow, loadStreamSimple } from "./pi-compat.js";
 
 // ---------------------------------------------------------------------------
 // Constants — flat named consts, grouped by concern (advisor pattern, b9428e9)
@@ -43,6 +43,7 @@ const MSG_NO_MODEL = "/btw requires an active model";
 
 // Errors (static)
 const ERR_EMPTY_RESPONSE = "/btw returned no text content.";
+const ERR_NO_FINAL_MESSAGE = "stream ended without a final message";
 
 // Errors (parameterized)
 const errMisconfigured = (label: string, err: string) => `/btw model (${label}) is misconfigured: ${err}`;
@@ -156,7 +157,7 @@ function getCrossSessionHint(): string {
 }
 
 // ---------------------------------------------------------------------------
-// Executor — auth, message threading, completeSimple, four StopReason branches
+// Executor — auth, message threading, streamSimple, four StopReason branches
 // Modeled after rpiv-advisor/advisor.ts:225-336
 // ---------------------------------------------------------------------------
 
@@ -248,6 +249,7 @@ export async function executeBtw(
 	question: string,
 	ctx: ExtensionContext,
 	controller: AbortController,
+	onText: (accumulated: string) => void = () => {},
 ): Promise<BtwExecResult> {
 	const model = ctx.model;
 	if (!model) {
@@ -274,13 +276,12 @@ export async function executeBtw(
 	let built = buildBtwMessages(ctx, userMessage);
 
 	try {
-		const completeSimple = await loadCompleteSimple();
+		const streamSimple = await loadStreamSimple();
 		const overflowFn = await loadIsContextOverflow();
-		let retried = false;
-		const callCompleteSimple = async (
+		const callStreamSimple = async (
 			built: BtwBuiltContext,
 		): Promise<{ kind: "aborted"; stopReason: StopReason } | { kind: "completed"; response: AssistantMessage }> => {
-			const response = await completeSimple(
+			const stream = streamSimple(
 				model,
 				{ systemPrompt: built.systemPrompt, messages: built.messages, tools: [] },
 				{
@@ -289,25 +290,35 @@ export async function executeBtw(
 					signal: controller.signal, // own AbortController, NOT ctx.signal (Decision 8)
 				},
 			);
+			let response: AssistantMessage | undefined;
+			let accumulated = "";
+			for await (const event of stream) {
+				if (event.type === "text_delta") {
+					accumulated += event.delta;
+					onText(accumulated);
+				}
+				if (event.type === "done") response = event.message;
+				if (event.type === "error") response = event.error;
+			}
+			if (!response) throw new Error(ERR_NO_FINAL_MESSAGE);
 			if (response.stopReason === "aborted") {
 				return { kind: "aborted", stopReason: response.stopReason };
 			}
 			return { kind: "completed", response };
 		};
-		let outcome = await callCompleteSimple(built);
+		let outcome = await callStreamSimple(built);
 		if (outcome.kind === "aborted") return outcome;
 		let response = outcome.response;
 		// Overflow gate — exactly one retry. On the first response the host flags
 		// as context overflow (any stopReason), rebuild the branch context with a
-		// halved keepBudget and re-call once. A flag bounds it to one retry; the
-		// recall's throw and the loader's rethrow both land in the surrounding
+		// halved keepBudget and re-call once. The second result is handled directly,
+		// so no third call is possible. A throw lands in the surrounding
 		// catch. /btw's fresh side call retries all three overflow stopReasons
 		// (error/stop/length), a deliberate divergence from the host's
 		// stopReason-based willRetry.
-		if (overflowFn && !retried && overflowFn(response, model.contextWindow)) {
-			retried = true;
+		if (overflowFn?.(response, model.contextWindow)) {
 			built = buildBtwMessages(ctx, userMessage, Math.floor(built.keepBudget / 2));
-			outcome = await callCompleteSimple(built);
+			outcome = await callStreamSimple(built);
 			if (outcome.kind === "aborted") return outcome;
 			response = outcome.response;
 		}
@@ -403,22 +414,39 @@ async function handleBtwCommand(_pi: ExtensionAPI, args: string, ctx: ExtensionC
 
 	const controller = new AbortController();
 	const historySnapshot = [...getSessionHistory(ctx)];
+	const stopWaiting = startBtwWaiting(ctx, question, controller);
+	let overlayPromise: Promise<void> | undefined;
+	let overlayController: BtwOverlayController | undefined;
+	const showAnswer = (text: string): BtwOverlayController => {
+		if (overlayController) {
+			overlayController.setAnswer(text);
+			return overlayController;
+		}
+		stopWaiting();
+		const shown = showBtwOverlay({
+			ctx,
+			question,
+			answer: text,
+			history: historySnapshot,
+			controller,
+			onClearHistory: () => clearSessionHistory(ctx),
+		});
+		overlayPromise = shown.overlayPromise;
+		overlayController = shown.controller;
+		return shown.controller;
+	};
 
-	const { overlayPromise, controllerReady } = showBtwOverlay({
-		ctx,
-		question,
-		history: historySnapshot,
-		controller,
-		onClearHistory: () => clearSessionHistory(ctx),
-	});
-
-	const overlayCtl = await controllerReady;
-	const result = await executeBtw(question, ctx, controller);
+	let result: BtwExecResult;
+	try {
+		result = await executeBtw(question, ctx, controller, showAnswer);
+	} finally {
+		stopWaiting();
+	}
 
 	switch (result.kind) {
 		case "success": {
-			overlayCtl.setAnswer(result.answer);
-			if (result.trimmed) overlayCtl.setTrimmed(); // success-only: TS narrows result here
+			const shownController = showAnswer(result.answer);
+			if (result.trimmed) shownController.setTrimmed();
 			pushSessionTurn(ctx, {
 				userMessage: result.userMessage,
 				assistantMessage: result.assistantMessage,
@@ -427,11 +455,11 @@ async function handleBtwCommand(_pi: ExtensionAPI, args: string, ctx: ExtensionC
 			break;
 		}
 		case "aborted": {
-			// User Esc'd — overlay already dismissed via done(); no further action
 			break;
 		}
 		case "error": {
-			overlayCtl.setError(result.error);
+			if (overlayController) overlayController.setError(result.error);
+			else ctx.ui.notify(result.error, "error");
 			break;
 		}
 	}

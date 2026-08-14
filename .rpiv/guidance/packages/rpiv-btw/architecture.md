@@ -4,12 +4,12 @@
 Sibling Pi extension in `rpiv-mono`. Lockstep version with the rest of the `@juicesharp/rpiv-*` family — never bump independently. Not in `rpiv-pi`'s auto-install bundle (dropped from `siblings.ts` and its `peerDependencies`) — installed and loaded independently.
 
 ## Responsibility
-Slash-command-only Pi extension. Spawns a one-off side call to the same primary model with a read-only clone of the current conversation as context, renders the answer in a bottom-anchored ephemeral overlay, and never writes back to the main agent's transcript or to disk. Per-session history is process-scoped via a `globalThis` Symbol-keyed singleton.
+Slash-command-only Pi extension. Spawns a one-off side call to the same primary model with a read-only clone of the current conversation as context, streams the answer into a centered ephemeral card, and never writes back to the main agent's transcript or to disk. Per-session history is process-scoped via a `globalThis` Symbol-keyed singleton.
 
 ## Dependencies
-- **`@earendil-works/pi-coding-agent`** (peer): `ExtensionAPI`/`ExtensionContext`, branch-to-LLM converter (`convertToLlm`), `SessionEntry`/`Theme` types
-- **`@earendil-works/pi-ai`** (peer): the side-call entry (`completeSimple` with `tools: []`, resolved lazily via `pi-compat.ts` — never a static import) and message types
-- **`@earendil-works/pi-tui`** (peer): overlay/component types (`OverlayOptions`, `Component`, `TUI`), key-matching (`matchesKey`), ANSI-safe width/wrap helpers
+- **`@earendil-works/pi-coding-agent`** (peer): `ExtensionAPI`/`ExtensionContext`, branch-to-LLM converter (`convertToLlm`), Markdown theme, `SessionEntry`/`Theme` types
+- **`@earendil-works/pi-ai`** (peer): the side-call entry (`streamSimple` with `tools: []`, resolved lazily via `pi-compat.ts` — never a static import) and message types
+- **`@earendil-works/pi-tui`** (peer): `Markdown`, overlay/component types (`OverlayOptions`, `Component`, `TUI`), key-matching (`matchesKey`), ANSI-safe width/wrap helpers
 
 ## Consumers
 - **Pi extension host**: loads via `pi.extensions: ["./index.ts"]` — the sole consumer
@@ -17,7 +17,7 @@ Slash-command-only Pi extension. Spawns a one-off side call to the same primary 
 ## Module Structure
 ```
 .                — Flat package. Logic + state in one source module; overlay controller in another;
-                   host-version-tolerant `completeSimple` loader in `pi-compat.ts` (shipped via `files`);
+                   host-version-tolerant `streamSimple` loader in `pi-compat.ts` (shipped via `files`);
                    composer (index.ts) wires command registrar + lifecycle hooks.
 prompts/         — System-prompt asset shipped via `files`. Loaded once at module init.
 ```
@@ -27,7 +27,7 @@ Five layered constraints keep the main transcript untouched:
 1. **Read-only branch clone** — a snapshot of session messages is taken at `message_end` and held until invalidation; calls work off the clone (cold-start only: a live `ctx.sessionManager.getBranch()` read before the first `message_end`)
 2. **Direct LLM call bypasses the agent loop** — the call runs **without** tools (no `registerTool` here; the call site MUST pass an empty tool set) so no tool turn lands in transcript
 3. **Own `AbortController`** — never reuse the caller's session signal; Esc cancels only the side-question
-4. **Bottom-slot overlay via `ctx.ui.custom`** — no agent-message emission, so nothing surfaces in transcript
+4. **Footer status plus centered card** — `ctx.ui.setStatus` owns the empty wait; `ctx.ui.custom` opens the card on the first token; neither emits an agent message
 5. **Process-scoped, session-keyed storage** — history lives on a well-known `globalThis` Symbol cell, never on disk
 
 ## Stable-Reference Prompt-Cache Discipline
@@ -44,8 +44,8 @@ The cached branch clone is dropped on `session_compact` and `session_tree`. With
 - **Host-primitives rule** — `btw-budget.ts` value-imports the six host primitives (`calculateContextTokens`, `convertToLlm`, `estimateTokens`, `findCutPoint`, `getLastAssistantUsage`, `sessionEntryToContextMessages`) from `@earendil-works/pi-coding-agent` with no re-implementation. It deliberately does NOT reuse the host's backward `findTurnStartIndex` for the forward turn-start scan — the host's scan direction is wrong for this package's trim semantics. Branch accounting anchors on the last valid assistant usage PLUS `estimateTokens` over every unmetered entry after it (turns the provider hasn't billed still occupy the window). The budget constants live in `btw-budget.ts` (leaf module; `btw.ts` re-exports them) so the module cycle stays type-only at runtime.
 - **Single-retry rule** — exactly one overflow retry halves `keepBudget`; the rebuild re-slices the cached snapshot (never re-reads `ctx.sessionManager.getBranch()`). Legacy hosts where `isContextOverflow` is absent degrade gracefully with no retry, and never crash.
 
-## Version-Tolerant `completeSimple` Resolution
-`executeBtw` awaits `loadCompleteSimple()` from `pi-compat.ts` — never a static import, because pi-ai resolves against the HOST's copy (peer `"*"`). It tries `@earendil-works/pi-ai/compat` first (Pi >= 0.80.1 moved the global dispatch API there), falling back to the package root ONLY on module-resolution failures (`ERR_PACKAGE_PATH_NOT_EXPORTED` / `ERR_MODULE_NOT_FOUND` / `MODULE_NOT_FOUND`, walking the error `cause` chain); any other `/compat` error rethrows so real init failures surface instead of being masked. `/compat` is temporary — when pi's ModelManager migration deletes it, `pi-compat.ts` is the single place to migrate.
+## Version-Tolerant `streamSimple` Resolution
+`executeBtw` awaits `loadStreamSimple()` from `pi-compat.ts` — never a static import, because pi-ai resolves against the HOST's copy (peer `"*"`). It tries `@earendil-works/pi-ai/compat` first (Pi >= 0.80.1 moved the global dispatch API there), falling back to the package root ONLY on module-resolution failures (`ERR_PACKAGE_PATH_NOT_EXPORTED` / `ERR_MODULE_NOT_FOUND` / `MODULE_NOT_FOUND`, walking the error `cause` chain); any other `/compat` error rethrows so real init failures surface instead of being masked. `/compat` is temporary — when pi's ModelManager migration deletes it, `pi-compat.ts` is the single place to migrate.
 
 ## Architectural Boundaries
 - **NO disk persistence** — `globalThis` only; lost on Pi exit by design
@@ -58,9 +58,9 @@ The cached branch clone is dropped on `session_compact` and `session_tree`. With
 ## Customizing the Overlay
 Architectural rules for overlay edits:
 - **Mode set is a closed union** — extending modes requires a matching setter + render trigger so state and view never desync
-- **Styling goes through `theme.fg/bg(...)`** and width-safe pi-tui helpers — never raw ANSI; visible-width math must be SGR-aware
-- **Keys via `matchesKey`** — never compare raw key bytes; Esc must abort the controller AND resolve `done()`
-- **Scroll is layout-driven** — natural rows are laid out first, then clipped from the top when overflowing; never a separate scroll model
+- **Styling goes through the host theme** and width-safe pi-tui helpers — never raw ANSI; visible-width math must be SGR-aware
+- **Keys use `matchesKey`** — Esc during the footer wait must abort and consume the key; Esc in the card must also resolve `done()`
+- **Scroll is layout-driven** — fixed chrome surrounds a body capped at 70% terminal height; streaming follows the tail until the user scrolls up
 </important>
 
 <important if="you are adding a new side-question variant">

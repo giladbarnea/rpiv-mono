@@ -11,9 +11,9 @@
 
 Ask a side question without polluting the main conversation. `rpiv-btw` adds
 `/btw <question>` to [Pi Agent](https://github.com/badlogic/pi-mono) — your same
-primary model answers in a panel at the bottom of the terminal, using a read-only
-clone of the current conversation as context. The answer never enters the
-transcript and never touches disk.
+primary model answers in a centered card, using a read-only clone of the current
+conversation as context. The answer streams from the first token, renders as
+Markdown, never enters the transcript, and never touches disk.
 
 ## Install
 
@@ -31,25 +31,28 @@ Type `/btw` followed by your question:
 /btw why did we switch from sockets to SSE last week?
 ```
 
-A panel opens at the bottom of the terminal with your question on a banner, a `…`
-while the model works, and the answer when it arrives. Prior `/btw` questions from
-this session are listed under the banner, so follow-ups have context.
+While the model works, the footer status line shows `⠋ btw <your question>`.
+Nothing takes focus. The centered card opens when the first token arrives and
+streams the Markdown answer. Prior `/btw` questions from this session appear in
+the card, so follow-ups have context.
 
 `/btw` uses whatever model is already driving your session — there is nothing to
 pick, but Pi needs an active model with working credentials (`/login`).
 
-![The /btw panel at the bottom of a Pi Agent terminal, showing the echoed question, a multi-paragraph answer, and the key-hint footer](https://raw.githubusercontent.com/juicesharp/rpiv-mono/main/packages/rpiv-btw/docs/overlay.jpg)
+![The centered /btw card over a Pi Agent terminal, showing the question, answer, and key-hint footer](https://raw.githubusercontent.com/juicesharp/rpiv-mono/main/packages/rpiv-btw/docs/overlay.jpg)
 
 | Key | Action |
 | --- | --- |
-| `↑` / `↓` | Scroll the panel whenever content overflows — the hint appears once the answer arrives |
+| `↑` / `↓` | Scroll the card whenever content exceeds its 70% height cap |
 | `x` | Clear this session's `/btw` history — hint shown only when you have prior entries |
-| `Esc` | Dismiss the panel, cancelling the call if it is still running |
+| `Esc` | Cancel during the footer wait, or dismiss the card and cancel the active call |
 
 ## What you get
 
 - **Nothing leaks into the main chat** — the answer is drawn in an overlay, never
   emitted as an agent message, never written to the transcript, never written to disk.
+- **The answer starts at the first token** — the footer wait does not take focus,
+  then Pi renders the stream as Markdown inside the card.
 - **The side question already knows your work** — it is handed a read-only clone
   of the current conversation branch, so you do not re-explain context.
 - **Follow-ups have their own thread** — every `/btw` turn in a session is replayed
@@ -61,7 +64,7 @@ pick, but Pi needs an active model with working credentials (`/login`).
 - **Correct after compaction** — the context snapshot is rebuilt whenever the
   conversation is compacted or re-branched, so a later `/btw` never answers off a
   stale view.
-- **No tools, plain text** — a side question cannot edit a file or run a command.
+- **No tools** — a side question cannot edit a file or run a command.
 
 ## Reference
 
@@ -70,7 +73,7 @@ pick, but Pi needs an active model with working credentials (`/login`).
   history threading, the cross-session question hint, and the no-pollution
   guarantees.
 - [Architecture](https://github.com/juicesharp/rpiv-mono/blob/main/packages/rpiv-btw/docs/architecture.md) — modules, registered command and
-  hooks, overlay layout and key handling, process-scoped state, Pi host-version
+  hooks, card layout and key handling, process-scoped state, Pi host-version
   tolerance, and the full error-message list.
 
 ## Requirements
