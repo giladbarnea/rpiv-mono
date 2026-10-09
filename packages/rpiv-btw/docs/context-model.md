@@ -5,13 +5,13 @@ piece comes from, and what is guaranteed never to leave the panel.
 
 ## The request
 
-Each `/btw` call is a single non-streaming completion against `ctx.model` — the
-same primary model driving your session. There is no model picker and no
+Each `/btw` call streams from `ctx.model`, the same primary model driving your
+session. Context overflow can trigger one retry with a smaller branch budget. There is no model picker and no
 lighter-weight side model.
 
 | Part | Value |
 | --- | --- |
-| Model | `ctx.model`, with credentials from `ctx.modelRegistry.getApiKeyAndHeaders(model)` |
+| Model | `ctx.model`, using Pi's auth-aware runtime when available, or the legacy key/headers fallback |
 | System prompt | the bundled `prompts/btw-system.txt`, plus the cross-session hint appendix |
 | Messages | `[...branch clone, ...this-session /btw turns, your question]` |
 | Tools | `[]` — none, always |
@@ -50,7 +50,9 @@ branch clone and your new question. Follow-ups therefore work: the side thread
 has its own memory.
 
 History stores the **actual** `UserMessage` and `AssistantMessage` object
-references returned by the call — nothing is reconstructed or re-serialised.
+references returned by the call. The assistant message comes from the stream's
+`done` event, not from reconstructed deltas. Cancelled and failed turns are not
+stored.
 Concatenated in a fixed order, this keeps the prompt prefix byte-identical
 across calls, so provider-side prompt caching keeps hitting.
 
@@ -91,5 +93,6 @@ whitespace-collapsed and truncated to 200 characters.
   at module init.
 - **No tool use.** The call runs with `tools: []`, so a side question cannot edit
   a file or run a command even if it wanted to.
-- **No effect on the main session.** `Esc` aborts the `/btw` controller only; the
-  main agent's signal is never touched.
+- **No shared cancellation signal.** `Esc` in the open card aborts the `/btw`
+  controller only. Before the first text token, `/btw` does not intercept keys.
+  Session shutdown also aborts the side call before its context becomes stale.

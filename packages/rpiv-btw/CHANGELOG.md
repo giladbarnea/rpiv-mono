@@ -7,6 +7,13 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- `/btw` streams Markdown from the first text token into a centered, scrollable card (90% width, up to 70% height). The shared footer shows a braille wait indicator until the card opens. ([#150](https://github.com/juicesharp/rpiv-mono/issues/150))
+- Streaming preserves Pi's OAuth-aware `ModelRuntime` path, the legacy host fallback, and final-message history references.
+- Before the first text token, the editor keeps its normal keys, including `Esc`. Once the card opens, `Esc` cancels only the side call. Early errors use notification toasts; later errors stay in the card.
+- Session shutdown clears the wait indicator and cancels the side call. A second `/btw` is rejected while one is open.
+
 ## [2.12.0] - 2026-09-30
 
 ## [2.11.0] - 2026-09-21

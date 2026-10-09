@@ -24,19 +24,15 @@ vi.mock("@earendil-works/pi-ai/compat", async (importOriginal) => {
 	};
 });
 
-// Mock the loader so the overflow gate is controllable independently of the
-// real isContextOverflow regex behavior. loadCompleteSimple is routed to the
-// shared completeSimple spy (above) so existing mockResolvedValueOnce chains
-// keep working; loadIsContextOverflow defaults to undefined (legacy host, no
-// retry) and is overridden per-test in the overflow-retry suite.
-// getRuntimeCompleteSimple stays REAL: mock hosts have no `runtime` slot, so
-// tests default to the legacy path, and runtime-facade tests opt in by
-// defining a `runtime` slot on ctx.modelRegistry.
+// These context/error tests use completion-shaped fixtures, adapted to terminal
+// stream events below. Progressive streams are exercised in btw.streaming.test.ts
+// and through the real overlay in btw.command.test.ts. The runtime probe stays
+// real, so runtime tests opt in with a slot on the host registry.
 vi.mock("./pi-compat.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("./pi-compat.js")>();
 	return {
-		getRuntimeCompleteSimple: actual.getRuntimeCompleteSimple,
-		loadCompleteSimple: vi.fn(),
+		getRuntimeStreamSimple: actual.getRuntimeStreamSimple,
+		loadStreamSimple: vi.fn(),
 		loadIsContextOverflow: vi.fn(),
 	};
 });
@@ -58,7 +54,7 @@ import {
 	registerMessageEndSnapshot,
 	userMessageText,
 } from "./btw.js";
-import { loadCompleteSimple, loadIsContextOverflow } from "./pi-compat.js";
+import { loadIsContextOverflow, loadStreamSimple } from "./pi-compat.js";
 
 // Pins the substring `isStaleCtxError` matches in pi-core's invalidated-proxy error.
 const STALE_CTX_MESSAGE = "This extension ctx is stale after session replacement or reload.";
@@ -77,13 +73,24 @@ function makeCompletionResponse(input: {
 	} as unknown as AssistantMessage;
 }
 
+function completionStream(response: Promise<AssistantMessage>) {
+	return {
+		async *[Symbol.asyncIterator]() {
+			const message = await response;
+			if (message.stopReason === "error" || message.stopReason === "aborted") {
+				yield { type: "error", reason: message.stopReason, error: message };
+				return;
+			}
+			yield { type: "done", reason: message.stopReason, message };
+		},
+	};
+}
+
 beforeEach(() => {
 	vi.mocked(completeSimple).mockReset();
-	vi.mocked(loadCompleteSimple).mockReset();
+	vi.mocked(loadStreamSimple).mockReset();
 	vi.mocked(loadIsContextOverflow).mockReset();
-	// Route the loader to the shared completeSimple spy so existing
-	// mockResolvedValueOnce(makeCompletionResponse(...)) chains keep working.
-	vi.mocked(loadCompleteSimple).mockResolvedValue(completeSimple as never);
+	vi.mocked(loadStreamSimple).mockResolvedValue((...args) => completionStream(completeSimple(...args)) as never);
 	// Default: legacy host (isContextOverflow absent) → no retry. Per-test
 	// overrides set a real overflowFn to exercise the gate.
 	vi.mocked(loadIsContextOverflow).mockResolvedValue(undefined);
@@ -222,8 +229,8 @@ describe("executeBtw — error branches", () => {
 		const ctx = createMockCtx();
 		ctx.model = { provider: "a", id: "m" } as never;
 		const runtime = {
-			completeSimple: vi.fn((..._args: unknown[]) =>
-				Promise.resolve(makeCompletionResponse({ text: "oauth answer" })),
+			streamSimple: vi.fn((..._args: unknown[]) =>
+				completionStream(Promise.resolve(makeCompletionResponse({ text: "oauth answer" }))),
 			),
 		};
 		// OAuth-backed providers (e.g. kimi-coding) resolve ok with no literal key;
@@ -238,8 +245,8 @@ describe("executeBtw — error branches", () => {
 		const r = await executeBtw("q", ctx, new AbortController());
 		expect(r.kind).toBe("success");
 		expect(completeSimple).not.toHaveBeenCalled();
-		expect(runtime.completeSimple).toHaveBeenCalledTimes(1);
-		const options = runtime.completeSimple.mock.calls[0]?.[2] as Record<string, unknown> | undefined;
+		expect(runtime.streamSimple).toHaveBeenCalledTimes(1);
+		const options = runtime.streamSimple.mock.calls[0]?.[2] as Record<string, unknown> | undefined;
 		expect(options).not.toHaveProperty("apiKey");
 		expect(options).not.toHaveProperty("headers");
 		expect(options).toHaveProperty("signal");
@@ -248,15 +255,15 @@ describe("executeBtw — error branches", () => {
 		const ctx = createMockCtx();
 		ctx.model = { provider: "a", id: "m" } as never;
 		const runtime = {
-			completeSimple: vi.fn((..._args: unknown[]) =>
-				Promise.resolve(makeCompletionResponse({ text: "runtime answer" })),
+			streamSimple: vi.fn((..._args: unknown[]) =>
+				completionStream(Promise.resolve(makeCompletionResponse({ text: "runtime answer" }))),
 			),
 		};
 		Object.defineProperty(ctx.modelRegistry, "runtime", { value: runtime });
 		const r = await executeBtw("q", ctx, new AbortController());
 		expect(r.kind).toBe("success");
 		expect(completeSimple).not.toHaveBeenCalled();
-		const options = runtime.completeSimple.mock.calls[0]?.[2] as Record<string, unknown> | undefined;
+		const options = runtime.streamSimple.mock.calls[0]?.[2] as Record<string, unknown> | undefined;
 		expect(options).not.toHaveProperty("apiKey");
 	});
 	it("returns aborted when stopReason=aborted", async () => {
@@ -313,21 +320,32 @@ describe("executeBtw — cross-session hint", () => {
 		ctx.model = { provider: "a", id: "m" } as never;
 
 		vi.mocked(completeSimple).mockResolvedValueOnce(makeCompletionResponse({ text: "first" }) as never);
-		await executeBtw("first-question", ctx, new AbortController());
+		const first = await executeBtw("first-question", ctx, new AbortController());
+		expect(first.kind).toBe("success");
+		if (first.kind !== "success") throw new Error("expected first answer");
+		(globalThis as Record<symbol, { histories: Map<string, BtwTurn[]> }>)[BTW_STATE_KEY].histories.set(
+			"/tmp/test-session.jsonl",
+			[first],
+		);
 
 		vi.mocked(completeSimple).mockImplementationOnce((async (_model: unknown, req: { systemPrompt: string }) => {
 			expect(req.systemPrompt).toContain("## Recent /btw questions across sessions");
 			expect(req.systemPrompt).toContain("first-question");
 			return makeCompletionResponse({ text: "second" });
 		}) as never);
-		await executeBtw("second-question", ctx, new AbortController());
+		expect(await executeBtw("second-question", ctx, new AbortController())).toMatchObject({ kind: "success" });
 	});
 	it("caps cross-session list to CROSS_SESSION_HINT_LIMIT=10", async () => {
 		const ctx = createMockCtx();
 		ctx.model = { provider: "a", id: "m" } as never;
 		for (let i = 0; i < 12; i++) {
 			vi.mocked(completeSimple).mockResolvedValueOnce(makeCompletionResponse({ text: `a${i}` }) as never);
-			await executeBtw(`q${i}`, ctx, new AbortController());
+			const result = await executeBtw(`q${i}`, ctx, new AbortController());
+			expect(result.kind).toBe("success");
+			if (result.kind !== "success") throw new Error("expected answer");
+			(globalThis as Record<symbol, { histories: Map<string, BtwTurn[]> }>)[BTW_STATE_KEY].histories
+				.get("/tmp/test-session.jsonl")
+				?.push(result);
 		}
 		vi.mocked(completeSimple).mockImplementationOnce((async (_m: unknown, req: { systemPrompt: string }) => {
 			const lines = req.systemPrompt.match(/^\d+\. /gm) ?? [];
@@ -336,7 +354,7 @@ describe("executeBtw — cross-session hint", () => {
 			expect(req.systemPrompt).not.toContain("q0.");
 			return makeCompletionResponse({ text: "ok" });
 		}) as never);
-		await executeBtw("final", ctx, new AbortController());
+		expect(await executeBtw("final", ctx, new AbortController())).toMatchObject({ kind: "success" });
 	});
 });
 
@@ -353,7 +371,7 @@ describe("executeBtw — branch threading", () => {
 			});
 			return makeCompletionResponse({ text: "ok" });
 		}) as never);
-		await executeBtw("q", ctx, new AbortController());
+		expect(await executeBtw("q", ctx, new AbortController())).toMatchObject({ kind: "success" });
 	});
 });
 

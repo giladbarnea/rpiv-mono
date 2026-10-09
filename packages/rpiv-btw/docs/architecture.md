@@ -7,11 +7,11 @@ how state is stored, and how the package tolerates different Pi host versions.
 
 ```
 rpiv-btw/
-├── index.ts             — entry; registers the command + 3 hooks
+├── index.ts             — entry; registers the command + 4 hooks
 ├── btw.ts               — state, snapshots, threading, the model call
 ├── btw-budget.ts        — history cap + branch fit
 ├── btw-messages.ts      — BtwTurn + message-text extractors
-├── btw-ui.ts            — bottom-anchored overlay and key handling
+├── btw-ui.ts            — centered Markdown card, footer wait status and keys
 ├── pi-compat.ts         — host-tolerant pi-ai /compat loaders
 └── prompts/btw-system.txt — system prompt for the side call
 ```
@@ -34,13 +34,14 @@ One slash command:
 | --- | --- |
 | `/btw <question>` | `Ask a side question without polluting the main conversation` |
 
-Three lifecycle hooks:
+Four lifecycle hooks:
 
 | Event | Behavior |
 | --- | --- |
 | `message_end` | Snapshots the branch, only for assistant messages whose `stopReason` is not `toolUse` |
 | `session_compact` | Invalidates this session's cached snapshot |
 | `session_tree` | Invalidates this session's cached snapshot |
+| `session_shutdown` | Aborts the side call, clears its footer status and dismisses its card before context invalidation |
 
 No tools are registered. No CLI flags are added.
 
@@ -62,35 +63,40 @@ cross-import-graph singletons) means the cell survives module re-import, so
 when the Pi process exits — by design. Nothing is persisted to disk, and the
 package reads no environment variables and no config files.
 
-## Overlay
+## Wait and answer card
 
-`showBtwOverlay` mounts a `Component` through `ctx.ui.custom` with these options:
+Before the first text token, `startBtwWaiting` animates a braille indicator through
+`ctx.ui.setStatus("btw", ...)` every 80 ms. It adds no widget or input hook, so the
+editor and its keys remain available. Only one `/btw` can be open at a time.
+The wait stops on the first text token, completion, error or session shutdown.
+
+`showBtwOverlay` mounts a `Component` through `ctx.ui.custom` on the first text
+token, or on a successful final answer from a provider that emits no deltas:
 
 | Option | Value |
 | --- | --- |
-| `anchor` | `bottom-center` |
-| `width` | `100%` |
-| `maxHeight` | `85%` (`BTW_MAX_HEIGHT_RATIO = 0.85`) |
-| `margin` | `{ left: 0, right: 0, bottom: 0 }` |
+| `anchor` | `center` |
+| `width` | `90%` |
+| `maxHeight` | `70%` (`BTW_MAX_HEIGHT_RATIO = 0.7`) |
 
 Render order, top to bottom:
 
 ```
-banner        — your question on a themed stripe, padded to full width
-(blank)
-history       — prior "/btw <q>" lines for this session
-echo          — "/btw <q>" for the current question
-(blank)
-answer        — "…" while pending, the answer text, or the error in red
-(blank)
-footer        — key hints
+rounded border
+question title                         sticky
+separator
+history, Markdown answer or error      scrollable
+context-trim notice (when applicable)   scrollable
+separator
+key-hint footer                        sticky
+rounded border
 ```
 
-History and echo use a 2-column left gutter; the answer body uses 4. The panel
-grows upward with content. When the natural height exceeds
-`floor(terminalRows × 0.85)` (terminal rows default to 24 if unknown, with a
-floor of 4 rows), it clips from the top and `↑`/`↓` scroll that window —
-offset `0` shows the newest content.
+The card grows with content up to `floor(terminalRows × 0.7)`. Streaming follows
+the newest content until the user scrolls up. Returning to the bottom resumes
+following. The body uses Pi's `Markdown` and `getMarkdownTheme()` rather than a
+second Markdown renderer. Very short terminals omit the frame to retain a
+content viewport and the dismiss hint.
 
 ### Keys and footer gates
 
@@ -103,17 +109,25 @@ offset `0` shows the newest content.
 
 | Footer hint | Shown when |
 | --- | --- |
-| `↑/↓ to scroll` | the call is no longer pending (an answer or error has arrived) |
+| `↑/↓ to scroll` | the body exceeds its viewport |
 | `x to clear history` | this session has at least one prior `/btw` turn |
 | `Esc to dismiss` | always |
 
-Hints are joined with `" · "` and truncated to the panel width.
+Hints are joined with `" · "` and truncated to the card width. Before the card
+opens, `Esc` keeps Pi's normal behavior and does not cancel `/btw`.
 
 ## Host-version tolerance
 
 pi-ai resolves at runtime against the *host's* copy (all three pi peers are
 declared `"*"`), and pi moved the global dispatch API to a `/compat` entrypoint
-in 0.80.1. `pi-compat.ts` therefore resolves `completeSimple` lazily:
+in 0.80.1. `pi-compat.ts` first probes the host's auth-aware
+`ModelRuntime.streamSimple` through `getRuntimeStreamSimple(ctx.modelRegistry)`
+(available since Pi 0.80.8). The bound method receives only `{ signal }`, letting
+Pi apply OAuth credentials, headers and credential-derived endpoints. A missing
+literal API key is valid on this path.
+
+For hosts without runtime streaming, `loadStreamSimple()` resolves the legacy
+function and passes the preflight key and headers:
 
 1. `import("@earendil-works/pi-ai/compat")` — pi >= 0.80.1.
 2. On a **module-resolution** failure only, fall back to
@@ -128,7 +142,7 @@ init — rethrows, so a real failure surfaces instead of being masked by a root
 import that may not have the export.
 
 If neither entrypoint exposes the function, the call fails with
-`pi-ai does not expose completeSimple on /compat or the package root — unsupported host pi-ai version`.
+`pi-ai does not expose streamSimple on /compat or the package root — unsupported host pi-ai version`.
 
 `/compat` is documented upstream as temporary, so this module is the single place
 to migrate when it is removed.
@@ -143,13 +157,16 @@ Every notify and overlay error string the package can produce:
 | `Usage: /btw <question>` (warning) | the argument is empty or whitespace-only |
 | `/btw requires an active model` (error) | there is no `ctx.model` |
 | `/btw model (<provider>:<id>) is misconfigured: <err>` | credential lookup returned an error |
-| `/btw model (<provider>:<id>) has no API key available.` | lookup succeeded but the API key is empty |
-| `/btw call failed: <err ?? "unknown error">` | the completion returned `stopReason: "error"` |
-| `/btw call threw: <message>` | the completion threw and the call was not aborted |
+| `/btw model (<provider>:<id>) has no API key available.` | lookup succeeded but the API key is empty and runtime streaming is unavailable |
+| `/btw call failed: <err ?? "unknown error">` | the stream returned `stopReason: "error"` |
+| `/btw call threw: <message>` | credential lookup or streaming threw and the call was not aborted |
 | `/btw returned no text content.` | the response contained no text parts |
 
-The first three are `ctx.ui.notify` toasts raised before the overlay opens; the
-rest render inside the overlay in the error style.
+Errors before the first text token use `ctx.ui.notify` toasts and do not open a
+card. Errors after the card opens render inside it. A stream that closes without
+a terminal message reports `stream ended without a final message` through the
+`call threw` path. A second command while one is open produces a warning asking
+the user to wait for and dismiss the existing answer.
 
 ## Boundaries
 

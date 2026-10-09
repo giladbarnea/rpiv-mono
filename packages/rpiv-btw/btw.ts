@@ -2,8 +2,8 @@
  * @juicesharp/rpiv-btw — /btw side-question slash command.
  *
  * Asks the same primary model a one-off side question using the cloned primary
- * conversation as context. Answer is rendered ephemerally in a bottom-slot
- * overlay (never enters main agent's messages). History persists per-session-file
+ * conversation as context. Answer streams into an ephemeral centered card
+ * (never enters main agent's messages). History persists per-session-file
  * via globalThis-keyed storage; process-scoped only (no disk persistence).
  */
 
@@ -19,8 +19,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { type CappedHistory, capHistory, type FitBranchResult, fitBranch } from "./btw-budget.js";
 import { assistantMessageText, type BtwTurn, userMessageText } from "./btw-messages.js";
-import { showBtwOverlay } from "./btw-ui.js";
-import { getRuntimeCompleteSimple, loadCompleteSimple, loadIsContextOverflow } from "./pi-compat.js";
+import { type BtwOverlayController, showBtwOverlay, startBtwWaiting } from "./btw-ui.js";
+import { getRuntimeStreamSimple, loadIsContextOverflow, loadStreamSimple } from "./pi-compat.js";
 
 // ---------------------------------------------------------------------------
 // Constants — flat named consts, grouped by concern (advisor pattern, b9428e9)
@@ -40,9 +40,12 @@ export const CROSS_SESSION_HINT_LIMIT = 10;
 const MSG_REQUIRES_INTERACTIVE = "/btw requires interactive mode";
 const MSG_USAGE = "Usage: /btw <question>";
 const MSG_NO_MODEL = "/btw requires an active model";
+const MSG_ALREADY_RUNNING =
+	"/btw is already open. Wait for the answer, then dismiss it before asking another question.";
 
 // Errors (static)
 const ERR_EMPTY_RESPONSE = "/btw returned no text content.";
+const ERR_NO_FINAL_MESSAGE = "stream ended without a final message";
 
 // Errors (parameterized)
 const errMisconfigured = (label: string, err: string) => `/btw model (${label}) is misconfigured: ${err}`;
@@ -58,8 +61,7 @@ export { BTW_CONTEXT_RESERVE, BTW_HISTORY_TOKEN_BUDGET, BTW_NO_ANCHOR_SAFETY_FAC
 // (packages/rpiv-btw/btw-messages.ts); re-exported here so the package surface is
 // unchanged (packages/rpiv-btw/btw.test.ts / btw-ui.test.ts / btw-budget.test.ts still
 // import them from "./btw.js"). Import-then-re-export (not `export … from`) because
-// btw.ts consumes all three internally (userMessageText at :166,
-// assistantMessageText at :341, BtwTurn in BtwState/getSessionHistory/pushSessionTurn).
+// btw.ts consumes all three internally for hints, answers and session history.
 export { assistantMessageText, type BtwTurn, userMessageText };
 
 // ---------------------------------------------------------------------------
@@ -156,7 +158,7 @@ function getCrossSessionHint(): string {
 }
 
 // ---------------------------------------------------------------------------
-// Executor — auth, message threading, completeSimple, four StopReason branches
+// Executor — auth, message threading, streamSimple, four StopReason branches
 // Modeled after rpiv-advisor/advisor.ts:225-336
 // ---------------------------------------------------------------------------
 
@@ -248,6 +250,7 @@ export async function executeBtw(
 	question: string,
 	ctx: ExtensionContext,
 	controller: AbortController,
+	onText: (accumulated: string) => void | Promise<void> = () => {},
 ): Promise<BtwExecResult> {
 	const model = ctx.model;
 	if (!model) {
@@ -255,69 +258,86 @@ export async function executeBtw(
 	}
 	const modelLabel = `${model.provider}:${model.id}`;
 
-	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-	if (!auth.ok) {
-		return { kind: "error", error: errMisconfigured(modelLabel, auth.error) };
-	}
-	// OAuth-backed providers resolve `{ ok: true }` with no literal apiKey — their
-	// credentials are applied inside Pi's runtime facade. A missing key is only
-	// fatal on legacy hosts without that facade, where the global completion
-	// fallback needs the key passed explicitly.
-	const runtimeCompleteSimple = getRuntimeCompleteSimple(ctx.modelRegistry);
-	if (!auth.apiKey && !runtimeCompleteSimple) {
-		return { kind: "error", error: errNoApiKey(modelLabel) };
-	}
-
-	const userMessage: UserMessage = {
-		role: "user",
-		content: [{ type: "text", text: question }],
-		timestamp: Date.now(),
-	};
-	// `let` because the overflow retry reassigns `built` with a halved budget;
-	// buildBtwMessages returns BtwBuiltContext { messages, systemPrompt,
-	// droppedTurns, branchWasTrimmed, stubbed, keepBudget }.
-	let built = buildBtwMessages(ctx, userMessage);
-
 	try {
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+		if (controller.signal.aborted) return { kind: "aborted", stopReason: "aborted" };
+		if (!auth.ok) {
+			return { kind: "error", error: errMisconfigured(modelLabel, auth.error) };
+		}
+		// OAuth-backed providers resolve `{ ok: true }` with no literal apiKey — their
+		// credentials are applied inside Pi's runtime facade. A missing key is only
+		// fatal on legacy hosts without that facade, where the global completion
+		// fallback needs the key passed explicitly.
+		const runtimeStreamSimple = getRuntimeStreamSimple(ctx.modelRegistry);
+		if (!auth.apiKey && !runtimeStreamSimple) {
+			return { kind: "error", error: errNoApiKey(modelLabel) };
+		}
+
+		const userMessage: UserMessage = {
+			role: "user",
+			content: [{ type: "text", text: question }],
+			timestamp: Date.now(),
+		};
+		// `let` because the overflow retry reassigns `built` with a halved budget;
+		// buildBtwMessages returns BtwBuiltContext { messages, systemPrompt,
+		// droppedTurns, branchWasTrimmed, stubbed, keepBudget }.
+		let built = buildBtwMessages(ctx, userMessage);
+
 		// Prefer Pi's auth-aware runtime facade (resolved once above, before the
 		// missing-key guard). Unlike the global compatibility function, it runs
 		// request preparation and applies credential-derived fields — OAuth
 		// tokens, GitHub Copilot's OAuth-specific baseUrl. Do not pass the
 		// preflight key/headers to that path: explicit overrides would bypass
 		// that resolution.
-		const completeSimple = runtimeCompleteSimple ?? (await loadCompleteSimple());
-		const requestOptions = runtimeCompleteSimple
-			? { signal: controller.signal } // own AbortController, NOT ctx.signal (Decision 8)
+		const streamSimple = runtimeStreamSimple ?? (await loadStreamSimple());
+		const requestOptions = runtimeStreamSimple
+			? { signal: controller.signal } // own AbortController, NOT ctx.signal
 			: { apiKey: auth.apiKey, headers: auth.headers, signal: controller.signal };
 		const overflowFn = await loadIsContextOverflow();
-		let retried = false;
-		const callCompleteSimple = async (
+		const callStreamSimple = async (
 			built: BtwBuiltContext,
 		): Promise<{ kind: "aborted"; stopReason: StopReason } | { kind: "completed"; response: AssistantMessage }> => {
-			const response = await completeSimple(
+			if (controller.signal.aborted) return { kind: "aborted", stopReason: "aborted" };
+			const stream = streamSimple(
 				model,
 				{ systemPrompt: built.systemPrompt, messages: built.messages, tools: [] },
 				requestOptions,
 			);
+			let response: AssistantMessage | undefined;
+			let accumulated = "";
+			for await (const event of stream) {
+				if (controller.signal.aborted) return { kind: "aborted", stopReason: "aborted" };
+				if (event.type === "text_start" && accumulated) accumulated += "\n";
+				if (event.type === "text_delta") {
+					accumulated += event.delta;
+					await onText(accumulated);
+				}
+				// Keep the provider's final object, including usage and signatures,
+				// for reference-identical history. Deltas are display-only.
+				if (event.type === "done") response = event.message;
+				if (event.type === "error") response = event.error;
+			}
+			if (controller.signal.aborted) return { kind: "aborted", stopReason: "aborted" };
+			if (!response) throw new Error(ERR_NO_FINAL_MESSAGE);
 			if (response.stopReason === "aborted") {
 				return { kind: "aborted", stopReason: response.stopReason };
 			}
 			return { kind: "completed", response };
 		};
-		let outcome = await callCompleteSimple(built);
+		let outcome = await callStreamSimple(built);
 		if (outcome.kind === "aborted") return outcome;
 		let response = outcome.response;
 		// Overflow gate — exactly one retry. On the first response the host flags
 		// as context overflow (any stopReason), rebuild the branch context with a
-		// halved keepBudget and re-call once. A flag bounds it to one retry; the
-		// recall's throw and the loader's rethrow both land in the surrounding
+		// halved keepBudget and re-call once. The second result is handled directly,
+		// so no third call is possible. Stream and loader throws land in the surrounding
 		// catch. /btw's fresh side call retries all three overflow stopReasons
 		// (error/stop/length), a deliberate divergence from the host's
 		// stopReason-based willRetry.
-		if (overflowFn && !retried && overflowFn(response, model.contextWindow)) {
-			retried = true;
+		if (overflowFn?.(response, model.contextWindow)) {
+			await onText(""); // a retry replaces any partial answer from the first attempt
 			built = buildBtwMessages(ctx, userMessage, Math.floor(built.keepBudget / 2));
-			outcome = await callCompleteSimple(built);
+			outcome = await callStreamSimple(built);
 			if (outcome.kind === "aborted") return outcome;
 			response = outcome.response;
 		}
@@ -352,7 +372,7 @@ export async function executeBtw(
 }
 
 // ---------------------------------------------------------------------------
-// Registrars — 3 hooks total: command + message_end snapshot + compact/tree invalidate
+// Registrars — command, message_end snapshot, compact/tree invalidation, shutdown cleanup
 // ---------------------------------------------------------------------------
 
 export function registerMessageEndSnapshot(pi: ExtensionAPI): void {
@@ -390,13 +410,34 @@ function isStaleCtxError(e: unknown): boolean {
 }
 
 export function registerBtwCommand(pi: ExtensionAPI): void {
+	let activeController: AbortController | undefined;
+	// Pi emits shutdown before replacing the session or reloading extensions.
+	// Cancel while ctx is still live, so neither the wait timer nor late tokens
+	// can access the old session after its context has been invalidated.
+	pi.on("session_shutdown", async () => activeController?.abort());
 	pi.registerCommand(BTW_COMMAND_NAME, {
 		description: "Ask a side question without polluting the main conversation",
-		handler: (args: string, ctx: ExtensionCommandContext) => handleBtwCommand(pi, args, ctx),
+		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			if (activeController) {
+				ctx.ui.notify(MSG_ALREADY_RUNNING, "warning");
+				return;
+			}
+			const controller = new AbortController();
+			activeController = controller;
+			try {
+				await handleBtwCommand(args, ctx, controller);
+			} finally {
+				activeController = undefined;
+			}
+		},
 	});
 }
 
-async function handleBtwCommand(_pi: ExtensionAPI, args: string, ctx: ExtensionCommandContext): Promise<void> {
+async function handleBtwCommand(
+	args: string,
+	ctx: ExtensionCommandContext,
+	controller: AbortController,
+): Promise<void> {
 	if (!ctx.hasUI) {
 		ctx.ui.notify(MSG_REQUIRES_INTERACTIVE, "error");
 		return;
@@ -411,29 +452,50 @@ async function handleBtwCommand(_pi: ExtensionAPI, args: string, ctx: ExtensionC
 		return;
 	}
 
-	const controller = new AbortController();
 	const historySnapshot = [...getSessionHistory(ctx)];
+	const stopWaiting = startBtwWaiting(ctx, question);
+	controller.signal.addEventListener("abort", stopWaiting, { once: true });
+	let overlayPromise: Promise<void> | undefined;
+	let overlayController: BtwOverlayController | undefined;
+	const showAnswer = async (text: string): Promise<void> => {
+		if (controller.signal.aborted) return;
+		if (overlayController) {
+			overlayController.setAnswer(text);
+			return;
+		}
+		if (!text) return; // empty deltas and overflow resets must not take editor focus
+		stopWaiting();
+		const shown = showBtwOverlay({
+			ctx,
+			question,
+			answer: text,
+			history: historySnapshot,
+			controller,
+			onClearHistory: () => clearSessionHistory(ctx),
+		});
+		overlayPromise = shown.overlayPromise;
+		overlayController = await shown.controllerReady;
+	};
 
-	const { overlayPromise, controllerReady } = showBtwOverlay({
-		ctx,
-		question,
-		history: historySnapshot,
-		controller,
-		onClearHistory: () => clearSessionHistory(ctx),
-	});
-
-	const overlayCtl = await controllerReady;
-	const result = await executeBtw(question, ctx, controller);
+	let result: BtwExecResult;
+	try {
+		result = await executeBtw(question, ctx, controller, showAnswer);
+	} finally {
+		stopWaiting();
+		controller.signal.removeEventListener("abort", stopWaiting);
+	}
+	if (controller.signal.aborted) return;
 
 	switch (result.kind) {
 		case "success": {
-			overlayCtl.setAnswer(result.answer);
-			if (result.trimmed) overlayCtl.setTrimmed(); // success-only: TS narrows result here
+			await showAnswer(result.answer);
+			if (controller.signal.aborted) return;
+			if (result.trimmed) overlayController?.setTrimmed(); // success-only: TS narrows result here
 			pushSessionTurn(ctx, {
 				userMessage: result.userMessage,
 				assistantMessage: result.assistantMessage,
 			});
-			// No disk persistence — process-scoped only (Decision 4)
+			// No disk persistence — process-scoped only
 			break;
 		}
 		case "aborted": {
@@ -441,7 +503,8 @@ async function handleBtwCommand(_pi: ExtensionAPI, args: string, ctx: ExtensionC
 			break;
 		}
 		case "error": {
-			overlayCtl.setError(result.error);
+			if (overlayController) overlayController.setError(result.error);
+			else ctx.ui.notify(result.error, "error");
 			break;
 		}
 	}

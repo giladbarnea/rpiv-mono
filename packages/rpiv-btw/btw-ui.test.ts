@@ -1,290 +1,191 @@
-import type { Theme } from "@earendil-works/pi-coding-agent";
+import { stripVTControlCharacters } from "node:util";
+import {
+	type ExtensionCommandContext,
+	type ExtensionUIContext,
+	initTheme,
+	type Theme,
+} from "@earendil-works/pi-coding-agent";
 import { type TUI, visibleWidth } from "@earendil-works/pi-tui";
-import { makeTui } from "@juicesharp/rpiv-test-utils";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { createMockCtx, makeAssistantMessage, makeTheme, makeUserMessage } from "@juicesharp/rpiv-test-utils";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BtwTurn } from "./btw.js";
-import { BtwOverlayController, showBtwOverlay } from "./btw-ui.js";
+import { BtwOverlayController, showBtwOverlay, startBtwWaiting } from "./btw-ui.js";
 
-const identityTheme = {
-	fg: (_c: string, s: string) => s,
-	bg: (_c: string, s: string) => s,
-	bold: (s: string) => s,
-	strikethrough: (s: string) => s,
-} as unknown as Theme;
+const theme = makeTheme() as Theme;
+const turn = (question: string): BtwTurn => ({
+	userMessage: makeUserMessage(question),
+	assistantMessage: makeAssistantMessage({ text: "previous answer" }),
+});
 
-function makeTurn(q: string, a = "ans"): BtwTurn {
-	return {
-		userMessage: { role: "user", content: q, timestamp: 0 },
-		assistantMessage: {
-			role: "assistant",
-			content: [{ type: "text", text: a }],
-			api: "anthropic" as never,
-			provider: "anthropic" as never,
-			model: "m",
-			usage: {} as never,
-			stopReason: "done" as never,
-			timestamp: 0,
-		},
-	};
-}
-
-function makeController(opts: { question?: string; history?: BtwTurn[]; tui?: TUI; rows?: number } = {}) {
-	const tui = opts.tui ?? (makeTui() as unknown as TUI);
-	(tui as unknown as { terminal: { rows: number } }).terminal = { rows: opts.rows ?? 24 };
+function makeController(options: { question?: string; answer?: string; history?: BtwTurn[]; rows?: number } = {}) {
+	const terminal = { rows: options.rows ?? 24 };
+	const tui = { requestRender: vi.fn(), terminal } as unknown as TUI;
 	const done = vi.fn();
 	const controller = new AbortController();
 	const onClearHistory = vi.fn();
-	const ctl = new BtwOverlayController(
-		opts.question ?? "what?",
-		opts.history ?? [],
-		identityTheme,
+	const card = new BtwOverlayController(
+		options.question ?? "what?",
+		options.answer ?? "answer",
+		options.history ?? [],
+		theme,
 		tui,
 		done,
 		controller,
 		onClearHistory,
 	);
-	return { ctl, tui, done, controller, onClearHistory };
+	const render = (width = 80): string[] => card.render(width).map(stripVTControlCharacters);
+	return { card, render, tui, terminal, done, controller, onClearHistory };
 }
 
-afterEach(() => {
-	vi.restoreAllMocks();
-});
+beforeEach(() => initTheme("dark"));
+afterEach(() => vi.useRealTimers());
 
-describe("BtwOverlayController — initial (pending) render", () => {
-	it("contains the banner, echo line, pending glyph, and dismiss footer", () => {
-		const { ctl } = makeController({ question: "hello?" });
-		const out = ctl.render(80).join("\n");
-		expect(out).toContain("/btw hello?");
-		expect(out).toContain("…"); // PENDING_GLYPH
-		expect(out).toContain("Esc to dismiss");
+describe("BtwOverlayController", () => {
+	it("renders Markdown headings, emphasis, code and lists inside a frame", () => {
+		const { render } = makeController({
+			rows: 80,
+			answer: "# Heading\n\n**bold** and `code`\n\n- item\n\n```ts\nconst answer = 42;\n```",
+		});
+		const lines = render();
+		const text = lines.join("\n");
+		expect(lines[0]).toMatch(/^╭.*╮$/);
+		expect(lines.at(-1)).toMatch(/^╰.*╯$/);
+		expect(text).toContain("bold and code");
+		expect(text).toContain("const answer = 42;");
+		expect(text).not.toContain("**bold**");
+		expect(text).not.toContain("# Heading");
+		expect(text).toContain("Esc to dismiss");
 	});
 
-	it("does NOT show 'scroll' or 'clear' hints when pending + no history", () => {
-		const { ctl } = makeController({ question: "q" });
-		const out = ctl.render(80).join("\n");
-		expect(out).not.toContain("↑/↓ to scroll");
-		expect(out).not.toContain("x to clear history");
+	it("grows with a short answer without advertising unnecessary scrolling", () => {
+		const { card, render } = makeController();
+		expect(render()).toHaveLength(7);
+		expect(render().join("\n")).not.toContain("to scroll");
+		card.setAnswer("one\n\ntwo");
+		expect(render().length).toBeGreaterThan(7);
 	});
 
-	it("shows 'x to clear history' hint when history is non-empty", () => {
-		const { ctl } = makeController({ history: [makeTurn("prev")] });
-		const out = ctl.render(80).join("\n");
-		expect(out).toContain("x to clear history");
+	it.each([8, 12, 40, 80])("keeps every row within %i visible columns, including Unicode and long code", (width) => {
+		const { card } = makeController({
+			question: "界🙂 é".repeat(50),
+			history: [turn("multi\nline 界".repeat(50))],
+			answer: `**界🙂**\n\n\`\`\`\n${"x".repeat(200)}\n\`\`\``,
+		});
+		for (const line of card.render(width)) expect(visibleWidth(line)).toBe(width);
 	});
-});
 
-describe("BtwOverlayController — setAnswer", () => {
-	it("replaces pending glyph with the answer text", () => {
-		const { ctl, tui } = makeController();
-		ctl.setAnswer("forty-two");
-		const out = ctl.render(80).join("\n");
-		expect(out).toContain("forty-two");
-		expect(out).not.toContain("…");
+	it("follows streaming text, keeps scrolled-up content still, and resumes following at the bottom", () => {
+		const { card, render } = makeController();
+		const body = Array.from({ length: 30 }, (_, index) => `row-${String(index + 1).padStart(2, "0")}`).join("\n");
+		card.setAnswer(body);
+		expect(render().join("\n")).toContain("row-30");
+		for (let index = 0; index < 100; index++) card.handleInput("\u001b[A");
+		const top = render();
+		expect(top.join("\n")).toContain("row-01");
+		expect(top.join("\n")).not.toContain("row-30");
+		expect(top[1]).toContain("/btw what?");
+		expect(top.at(-2)).toContain("Esc to dismiss");
+		card.setAnswer(`${body}\nrow-31`);
+		expect(render()).toEqual(top);
+		for (let index = 0; index < 100; index++) card.handleInput("\u001b[B");
+		card.setAnswer(`${body}\nrow-31\nrow-32`);
+		expect(render().join("\n")).toContain("row-32");
+	});
+
+	it("reflows on resize without losing the title, footer or newest text", () => {
+		const { card, render, terminal } = makeController({ answer: "word ".repeat(100), rows: 40 });
+		expect(render(80).length).toBeLessThanOrEqual(28);
+		terminal.rows = 16;
+		const narrow = render(40);
+		expect(narrow.length).toBeLessThanOrEqual(11);
+		expect(narrow[1]).toContain("/btw what?");
+		expect(narrow.at(-2)).toContain("Esc to dismiss");
+		card.invalidate();
+		expect(render(40)).toEqual(narrow);
+	});
+
+	it("keeps a dismiss hint visible even when the terminal is too short for the full frame", () => {
+		const { render } = makeController({ answer: "word ".repeat(100), rows: 8 });
+		const lines = render();
+		expect(lines.length).toBeLessThanOrEqual(Math.floor(8 * 0.7));
+		expect(lines.join("\n")).toContain("Esc to dismiss");
+	});
+
+	it("renders errors and adds the trim notice only once", () => {
+		const { card, render, tui } = makeController();
+		const before = render().length;
+		card.setTrimmed();
+		card.setTrimmed();
+		expect(render()).toHaveLength(before + 1);
+		expect(render().join("\n")).toContain("context trimmed to fit budget");
+		card.setError("remote failed");
+		expect(render().join("\n")).toContain("remote failed");
 		expect(tui.requestRender).toHaveBeenCalled();
 	});
 
-	it("enables the 'scroll' footer hint once the mode is no longer pending", () => {
-		const { ctl } = makeController();
-		ctl.setAnswer("a");
-		expect(ctl.render(80).join("\n")).toContain("↑/↓ to scroll");
-	});
-
-	it("wraps multi-line answers into the answer body", () => {
-		const { ctl } = makeController();
-		ctl.setAnswer("line1\nline2\nline3");
-		const out = ctl.render(80);
-		expect(out.some((l) => l.includes("line1"))).toBe(true);
-		expect(out.some((l) => l.includes("line2"))).toBe(true);
-		expect(out.some((l) => l.includes("line3"))).toBe(true);
-	});
-});
-
-describe("BtwOverlayController — setError", () => {
-	it("renders the error message in the answer slot", () => {
-		const { ctl } = makeController();
-		ctl.setError("boom: nope");
-		const out = ctl.render(80).join("\n");
-		expect(out).toContain("boom: nope");
-		expect(out).not.toContain("…");
-	});
-});
-
-describe("BtwOverlayController — setTrimmed", () => {
-	it("appends exactly one notice line and triggers requestRender", () => {
-		const { ctl, tui } = makeController({ rows: 100 });
-		ctl.setAnswer("answer-body");
-		const beforeLines = ctl.render(80).length; // 7 (un-trimmed parity)
-		ctl.setTrimmed();
-		const afterLines = ctl.render(80);
-		expect(afterLines.length).toBe(beforeLines + 1); // 8 — exactly one more line
-		expect(afterLines.join("\n")).toContain("context trimmed to fit budget");
-		expect(tui.requestRender).toHaveBeenCalled();
-	});
-
-	it("is a no-op on the un-trimmed path (line count unchanged)", () => {
-		const { ctl } = makeController({ rows: 100 });
-		ctl.setAnswer("answer-body");
-		// setTrimmed never called — render stays at the un-trimmed line count
-		expect(ctl.render(80).length).toBe(7);
-	});
-});
-
-describe("BtwOverlayController — handleInput", () => {
-	it("Esc aborts the controller and resolves done()", () => {
-		const { ctl, controller, done } = makeController();
-		ctl.handleInput("\u001b");
-		expect(controller.signal.aborted).toBe(true);
-		expect(done).toHaveBeenCalled();
-	});
-
-	it("'x' clears in-memory history and invokes onClearHistory", () => {
-		const { ctl, onClearHistory, tui } = makeController({ history: [makeTurn("a"), makeTurn("b")] });
-		ctl.handleInput("x");
-		expect(onClearHistory).toHaveBeenCalledTimes(1);
-		const out = ctl.render(80).join("\n");
-		expect(out).not.toContain("/btw a");
-		expect(out).not.toContain("/btw b");
-		expect(out).not.toContain("x to clear history");
-		expect(tui.requestRender).toHaveBeenCalled();
-	});
-
-	it("unknown keys do not abort or clear", () => {
-		const { ctl, controller, done, onClearHistory } = makeController();
-		ctl.handleInput("z");
-		expect(controller.signal.aborted).toBe(false);
-		expect(done).not.toHaveBeenCalled();
+	it("clears history only on lowercase x and collapses pasted question whitespace", () => {
+		const { card, render, onClearHistory } = makeController({ history: [turn(" multi\nline   question ")] });
+		expect(render().join("\n")).toContain("/btw multi line question");
+		card.handleInput("X");
 		expect(onClearHistory).not.toHaveBeenCalled();
+		card.handleInput("x");
+		expect(onClearHistory).toHaveBeenCalledOnce();
+		expect(render().join("\n")).not.toContain("multi line question");
+		expect(render().join("\n")).not.toContain("clear history");
+	});
+
+	it.each(["escape", "shutdown", "dispose"])("cancels the side call on %s", (reason) => {
+		const { card, controller, done } = makeController();
+		if (reason === "escape") card.handleInput("\u001b");
+		if (reason === "shutdown") controller.abort();
+		if (reason === "dispose") card.dispose();
+		expect(controller.signal.aborted).toBe(true);
+		if (reason !== "dispose") expect(done).toHaveBeenCalledOnce();
 	});
 });
 
-describe("BtwOverlayController — scroll + clipping", () => {
-	it("render() returns all natural lines when within maxRows", () => {
-		const { ctl } = makeController({ rows: 100 });
-		ctl.setAnswer("answer-body");
-		const lines = ctl.render(80);
-		// banner + blank + 0 history + echo + blank + 1 answer + blank + footer = 7
-		expect(lines.length).toBe(7);
-	});
-
-	it("clips top when content overflows terminal height; scroll↑ reveals older history", () => {
-		// Use distinct non-overlapping markers so substring matches are unambiguous.
-		const history: BtwTurn[] = Array.from({ length: 20 }, (_, i) => makeTurn(`mark-${i + 1}-end`));
-		const { ctl } = makeController({ history, rows: 10 });
-		ctl.setAnswer("A");
-		const base = ctl.render(80);
-		const maxRows = Math.floor(10 * 0.85); // 8
-		expect(base.length).toBe(maxRows);
-		// Bottom-anchored: footer + answer visible; earliest history hidden
-		expect(base.join("\n")).not.toContain("mark-1-end");
-		expect(base.join("\n")).toContain("mark-20-end");
-		expect(base.join("\n")).toContain("Esc to dismiss");
-		// Scroll up reveals older history at the top.
-		ctl.handleInput("\u001b[A");
-		const scrolled = ctl.render(80);
-		expect(scrolled.length).toBe(maxRows);
-	});
-
-	it("scroll↓ at bottom stays clamped (no throw, still renders maxRows)", () => {
-		const history: BtwTurn[] = Array.from({ length: 20 }, (_, i) => makeTurn(`mark-${i + 1}-end`));
-		const { ctl } = makeController({ history, rows: 10 });
-		ctl.setAnswer("A");
-		ctl.handleInput("\u001b[B"); // down
-		const out = ctl.render(80);
-		const maxRows = Math.floor(10 * 0.85);
-		expect(out.length).toBe(maxRows);
-	});
-
-	it("invalidate() is a callable no-op", () => {
-		const { ctl } = makeController();
-		expect(() => ctl.invalidate()).not.toThrow();
+describe("waiting status", () => {
+	it("animates only the shared footer and stops idempotently", () => {
+		vi.useFakeTimers();
+		const ctx = createMockCtx({ ui: { theme } }) as ExtensionCommandContext;
+		const stop = startBtwWaiting(ctx, "a\nquestion");
+		expect(ctx.ui.setStatus).toHaveBeenLastCalledWith("btw", "⠋ btw a question");
+		vi.advanceTimersByTime(80);
+		expect(ctx.ui.setStatus).toHaveBeenLastCalledWith("btw", "⠙ btw a question");
+		expect(ctx.ui.setWidget).not.toHaveBeenCalled();
+		expect(ctx.ui.onTerminalInput).not.toHaveBeenCalled();
+		stop();
+		stop();
+		vi.advanceTimersByTime(500);
+		expect(ctx.ui.setStatus).toHaveBeenCalledTimes(3);
+		expect(ctx.ui.setStatus).toHaveBeenLastCalledWith("btw", undefined);
+		expect(vi.getTimerCount()).toBe(0);
 	});
 });
 
-describe("BtwOverlayController — banner + echo formatting", () => {
-	it("banner is padded to full visible width", () => {
-		const { ctl } = makeController({ question: "q" });
-		const banner = ctl.render(40)[0];
-		expect(visibleWidth(banner)).toBe(40);
-	});
-
-	it("truncates long questions in the banner with ellipsis", () => {
-		const long = "a".repeat(200);
-		const { ctl } = makeController({ question: long });
-		const banner = ctl.render(40)[0];
-		expect(visibleWidth(banner)).toBe(40);
-		expect(banner).toContain("…");
-	});
-
-	it("history echo uses '/btw ' prefix and trims whitespace", () => {
-		const { ctl } = makeController({ history: [makeTurn("  multi\nline   q  ")] });
-		const out = ctl.render(80).join("\n");
-		expect(out).toContain("/btw multi line q");
-	});
-});
-
-describe("showBtwOverlay — factory wiring", () => {
-	it("invokes ctx.ui.custom with overlay options and resolves controllerReady with the BtwOverlayController", async () => {
-		const requestRender = vi.fn();
-		const tui = { requestRender, terminal: { rows: 24 } } as unknown as TUI;
-		const custom = vi.fn((factory: unknown, opts: unknown) => {
-			const f = factory as (
-				tui: TUI,
-				theme: Theme,
-				kb: undefined,
-				done: (v: undefined) => void,
-			) => BtwOverlayController;
-			const ctl = f(tui, identityTheme, undefined, () => {});
-			// Keep `opts` addressable for the assertion below.
-			(custom as unknown as { lastOpts: unknown }).lastOpts = opts;
-			return new Promise<void>(() => {
-				// keep pending so we can inspect the controller
-				void ctl;
-			});
-		});
-		const ctx = { ui: { custom } } as never;
-
-		const { controllerReady } = showBtwOverlay({
-			ctx,
-			question: "q",
-			history: [],
-			controller: new AbortController(),
-			onClearHistory: vi.fn(),
-		});
-
-		const ctl = await controllerReady;
-		expect(ctl).toBeInstanceOf(BtwOverlayController);
-		expect(custom).toHaveBeenCalledTimes(1);
-		const opts = (custom as unknown as { lastOpts: { overlay: boolean; overlayOptions: unknown } }).lastOpts;
-		expect(opts).toMatchObject({ overlay: true });
-		expect(opts.overlayOptions).toMatchObject({ anchor: "bottom-center" });
-	});
-
-	it("controller returned by the factory is the same one exposed via controllerReady", async () => {
-		let factoryCtl: BtwOverlayController | undefined;
-		const custom = vi.fn((factory: unknown) => {
-			const f = factory as (
-				tui: TUI,
-				theme: Theme,
-				kb: undefined,
-				done: (v: undefined) => void,
-			) => BtwOverlayController;
-			factoryCtl = f(
+describe("showBtwOverlay", () => {
+	it("mounts the real controller as a centered 90%-wide card", async () => {
+		const custom = vi.fn((factory: Parameters<ExtensionUIContext["custom"]>[0]) => {
+			factory(
 				{ requestRender: vi.fn(), terminal: { rows: 24 } } as unknown as TUI,
-				identityTheme,
-				undefined,
-				() => {},
+				theme,
+				undefined as never,
+				vi.fn(),
 			);
-			return new Promise<void>(() => {});
+			return Promise.resolve();
 		});
-		const ctx = { ui: { custom } } as never;
-		const { controllerReady } = showBtwOverlay({
-			ctx,
-			question: "q",
+		const shown = showBtwOverlay({
+			ctx: createMockCtx({ ui: { custom: custom as ExtensionUIContext["custom"] } }) as ExtensionCommandContext,
+			question: "question",
+			answer: "answer",
 			history: [],
 			controller: new AbortController(),
 			onClearHistory: vi.fn(),
 		});
-		const ctl = await controllerReady;
-		expect(ctl).toBe(factoryCtl);
+		expect(await shown.controllerReady).toBeInstanceOf(BtwOverlayController);
+		expect(custom).toHaveBeenCalledWith(expect.any(Function), {
+			overlay: true,
+			overlayOptions: { anchor: "center", width: "90%", maxHeight: "70%" },
+		});
 	});
 });

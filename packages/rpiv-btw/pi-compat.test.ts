@@ -1,144 +1,98 @@
-/**
- * pi-compat tests — the host-version-tolerant `completeSimple` loader.
- *
- * The consumer test files mock `@earendil-works/pi-ai/compat` to SUCCEED, so
- * the version-tolerance arms the shim exists for are exercised here instead:
- * /compat resolves (host >= 0.80.1), /compat unresolvable → root fallback
- * (host <= 0.79.x), a REAL /compat failure rethrows instead of masking, and a
- * host with neither export fails with a clear error.
- */
-
+/** Host-version tolerance: runtime binding, legacy resolution and real init failures. */
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getRuntimeCompleteSimple } from "./pi-compat.js";
+import { getRuntimeStreamSimple } from "./pi-compat.js";
 
-describe("getRuntimeCompleteSimple", () => {
-	it("returns a method bound to the host runtime", async () => {
+describe("getRuntimeStreamSimple", () => {
+	it("binds the streaming method to its host runtime", () => {
+		const stream = createAssistantMessageEventStream();
 		const runtime = {
-			completeSimple: vi.fn(function (this: unknown) {
+			streamSimple: vi.fn(function (this: unknown) {
 				expect(this).toBe(runtime);
-				return Promise.resolve(undefined as never);
+				return stream;
 			}),
 		};
-		const completeSimple = getRuntimeCompleteSimple({ runtime });
-
-		expect(completeSimple).toBeTypeOf("function");
-		if (!completeSimple) throw new Error("expected runtime completion facade");
-		await completeSimple(undefined as never, undefined as never);
-		expect(runtime.completeSimple).toHaveBeenCalledOnce();
+		const streamSimple = getRuntimeStreamSimple({ runtime });
+		expect(streamSimple).toBeTypeOf("function");
+		expect(streamSimple?.(undefined as never, undefined as never)).toBe(stream);
 	});
 
-	it("returns undefined for missing or malformed runtime facades", () => {
-		expect(getRuntimeCompleteSimple(undefined)).toBeUndefined();
-		expect(getRuntimeCompleteSimple({ runtime: null })).toBeUndefined();
-		expect(getRuntimeCompleteSimple({ runtime: { completeSimple: "not-a-function" } })).toBeUndefined();
+	it.each([undefined, null, {}, { runtime: null }, { runtime: { streamSimple: "not-a-function" } }])(
+		"falls back for an absent or malformed runtime: %j",
+		(registry) => expect(getRuntimeStreamSimple(registry)).toBeUndefined(),
+	);
+
+	it("falls back if a host rejects access to the private runtime slot", () => {
+		expect(
+			getRuntimeStreamSimple({
+				get runtime(): never {
+					throw new Error("private");
+				},
+			}),
+		).toBeUndefined();
 	});
 });
 
-describe("loadCompleteSimple", () => {
+describe("pi-ai loaders", () => {
 	afterEach(() => {
 		vi.doUnmock("@earendil-works/pi-ai/compat");
 		vi.doUnmock("@earendil-works/pi-ai");
 		vi.resetModules();
 	});
 
-	/** Import the shim AFTER the per-test doMocks so its dynamic imports resolve
-	 *  against them (vi.resetModules first drops any previously-cached copies). */
-	async function load(): Promise<unknown> {
-		const mod = await import("./pi-compat.js");
-		return mod.loadCompleteSimple();
-	}
-
-	it("resolves completeSimple from /compat when the host exposes it (pi >= 0.80.1)", async () => {
+	it("uses /compat for streaming and overflow detection when available", async () => {
 		vi.resetModules();
-		const compatFn = vi.fn();
-		vi.doMock("@earendil-works/pi-ai/compat", () => ({ completeSimple: compatFn }));
-		await expect(load()).resolves.toBe(compatFn);
+		const streamSimple = vi.fn();
+		const isContextOverflow = vi.fn();
+		vi.doMock("@earendil-works/pi-ai/compat", () => ({ streamSimple, isContextOverflow }));
+		const loaders = await import("./pi-compat.js");
+		expect(await loaders.loadStreamSimple()).toBe(streamSimple);
+		expect(await loaders.loadIsContextOverflow()).toBe(isContextOverflow);
 	});
 
-	it("falls back to the package root when /compat is not exported (host <= 0.79.x)", async () => {
-		vi.resetModules();
-		vi.doMock("@earendil-works/pi-ai/compat", () => {
-			// The code an installed-but-old pi-ai actually produces: the package
-			// resolves, but "./compat" is missing from its exports map.
-			throw Object.assign(new Error("Package subpath './compat' is not defined"), {
-				code: "ERR_PACKAGE_PATH_NOT_EXPORTED",
+	it.each(["ERR_PACKAGE_PATH_NOT_EXPORTED", "ERR_MODULE_NOT_FOUND", "MODULE_NOT_FOUND"])(
+		"falls back to the root on a nested %s resolution error",
+		async (code) => {
+			vi.resetModules();
+			vi.doMock("@earendil-works/pi-ai/compat", () => {
+				throw new Error("wrapped resolution error", { cause: Object.assign(new Error("unavailable"), { code }) });
 			});
-		});
-		const rootFn = vi.fn();
-		vi.doMock("@earendil-works/pi-ai", () => ({ completeSimple: rootFn }));
-		await expect(load()).resolves.toBe(rootFn);
-	});
+			const streamSimple = vi.fn();
+			const isContextOverflow = vi.fn();
+			vi.doMock("@earendil-works/pi-ai", () => ({ streamSimple, isContextOverflow }));
+			const loaders = await import("./pi-compat.js");
+			expect(await loaders.loadStreamSimple()).toBe(streamSimple);
+			expect(await loaders.loadIsContextOverflow()).toBe(isContextOverflow);
+		},
+	);
 
-	it("rethrows a non-resolution /compat failure instead of masking it with the root fallback", async () => {
+	it("does not hide a real /compat initialization error behind a working root export", async () => {
 		vi.resetModules();
 		vi.doMock("@earendil-works/pi-ai/compat", () => {
-			throw new Error("compat entrypoint exploded at module init");
+			throw new Error("initialization failed");
 		});
-		// A WORKING root export proves the rejection comes from the rethrow: the
-		// old catch-all `.catch` fallback would have resolved here.
-		vi.doMock("@earendil-works/pi-ai", () => ({ completeSimple: vi.fn() }));
-		await expect(load()).rejects.toThrow();
+		vi.doMock("@earendil-works/pi-ai", () => ({ streamSimple: vi.fn(), isContextOverflow: vi.fn() }));
+		const loaders = await import("./pi-compat.js");
+		await expect(loaders.loadStreamSimple()).rejects.toThrow();
+		await expect(loaders.loadIsContextOverflow()).rejects.toThrow();
 	});
 
-	it("fails with a clear error when neither entrypoint exposes completeSimple", async () => {
+	it("requires streaming but tolerates a host without an overflow detector", async () => {
 		vi.resetModules();
-		vi.doMock("@earendil-works/pi-ai/compat", () => ({}));
-		await expect(load()).rejects.toThrow(/completeSimple/);
-	});
-});
-
-describe("loadIsContextOverflow", () => {
-	afterEach(() => {
-		vi.doUnmock("@earendil-works/pi-ai/compat");
-		vi.doUnmock("@earendil-works/pi-ai");
-		vi.resetModules();
+		// Real module namespaces return undefined for absent exports. Explicit keys
+		// reproduce that behavior under Vitest's otherwise-strict mock namespace.
+		vi.doMock("@earendil-works/pi-ai/compat", () => ({ streamSimple: undefined, isContextOverflow: undefined }));
+		const loaders = await import("./pi-compat.js");
+		await expect(loaders.loadStreamSimple()).rejects.toThrow(/does not expose streamSimple/);
+		await expect(loaders.loadIsContextOverflow()).resolves.toBeUndefined();
 	});
 
-	/** Import the shim AFTER the per-test doMocks so its dynamic imports resolve
-	 *  against them (vi.resetModules first drops any previously-cached copies). */
-	async function load(): Promise<unknown> {
-		const mod = await import("./pi-compat.js");
-		return mod.loadIsContextOverflow();
-	}
-
-	it("resolves isContextOverflow from /compat when the host exposes it", async () => {
-		vi.resetModules();
-		const compatFn = vi.fn();
-		vi.doMock("@earendil-works/pi-ai/compat", () => ({ isContextOverflow: compatFn }));
-		await expect(load()).resolves.toBe(compatFn);
-	});
-
-	it("returns undefined (does not throw) when neither entrypoint exports isContextOverflow", async () => {
-		vi.resetModules();
-		// Provide the key explicitly as `undefined`: a real ESM namespace returns
-		// `undefined` (not throws) for a non-present export, but Vitest's strict mock
-		// throws on access of a key the factory omitted — providing the key as
-		// undefined faithfully simulates the production condition the loader degrades on.
-		vi.doMock("@earendil-works/pi-ai/compat", () => ({ isContextOverflow: undefined }));
-		await expect(load()).resolves.toBeUndefined();
-	});
-
-	it("falls back to the package root then returns undefined when /compat is unresolvable and root lacks the export", async () => {
+	it("tolerates a legacy root without an overflow detector", async () => {
 		vi.resetModules();
 		vi.doMock("@earendil-works/pi-ai/compat", () => {
-			// The code an installed-but-old pi-ai actually produces: the package
-			// resolves, but "./compat" is missing from its exports map.
-			throw Object.assign(new Error("Package subpath './compat' is not defined"), {
-				code: "ERR_PACKAGE_PATH_NOT_EXPORTED",
-			});
+			throw Object.assign(new Error("no compat"), { code: "ERR_PACKAGE_PATH_NOT_EXPORTED" });
 		});
 		vi.doMock("@earendil-works/pi-ai", () => ({ isContextOverflow: undefined }));
-		await expect(load()).resolves.toBeUndefined();
-	});
-
-	it("rethrows a non-resolution /compat failure instead of masking it as undefined", async () => {
-		vi.resetModules();
-		vi.doMock("@earendil-works/pi-ai/compat", () => {
-			throw new Error("compat entrypoint exploded at module init");
-		});
-		// A WORKING root export proves the rejection comes from the rethrow: the
-		// graceful-degradation path would have resolved undefined here.
-		vi.doMock("@earendil-works/pi-ai", () => ({ isContextOverflow: vi.fn() }));
-		await expect(load()).rejects.toThrow();
+		await expect((await import("./pi-compat.js")).loadIsContextOverflow()).resolves.toBeUndefined();
 	});
 });
